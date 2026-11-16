@@ -1,0 +1,98 @@
+[package]
+name = "veilforge"
+version = "1.0.0"
+edition = "2021"
+description = "An easy file and folder locker for Windows: lock, hide or ask for a password on open, without encrypting anything"
+authors = ["Zheer Khalid (https://zheer.dev)"]
+homepage = "https://zheer.dev"
+repository = "https://github.com/zheerkhalid/veilforge"
+license = "MIT"
+
+[lib]
+name = "veilforge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "VeilForge"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+eframe = { version = "0.31.1", default-features = false, features = ["glow", "default_fonts"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+raw-window-handle = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = { version = "0.15", default-features = false }
+winreg = "0.52"
+
+# Cryptography for the map file only (user files are never encrypted): RustCrypto.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "stream"] }
+blake2 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
+getrandom = "0.2"
+
+# Password strength estimation.
+zxcvbn = { version = "3", default-features = false }
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_Variant",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+tiny-skia = "0.11"
+embed-resource = "2.5"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+opt-level = 1

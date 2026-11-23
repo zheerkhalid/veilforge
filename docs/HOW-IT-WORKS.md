@@ -40,6 +40,40 @@ closed, after the idle time, when Windows locks, sleeps or you sign out, or
 when you choose "Lock now" from the tray icon. The shortcut necessarily shows
 the original name: that is the purpose of this mode.
 
+## Locking again
+
+Items you opened "for now" are protected again on their own: after the idle
+time you chose, when Windows locks, sleeps or you sign out, and whenever you
+ask. There are four ways to ask, and all of them lock every open item and
+VeilForge itself at once:
+
+- "Lock now" in the tray menu;
+- the **lock hotkey**, if you set one in Settings (for example Ctrl+Alt+L);
+- `VeilForge.exe --lock-now`, for a shortcut, a script or the Task Scheduler;
+- "Lock them now" on the lock screen, which appears there whenever something
+  is still open. Locking never needs the master password.
+
+The automatic timers only run while VeilForge is running (in the tray is
+enough). An item that a program still has open cannot be locked; VeilForge
+says so and leaves it open rather than forcing anything.
+
+Closing the window to the tray also locks VeilForge itself (the list), unless
+you switch that off. Ctrl+L does the same while the window is in front.
+
+## The wrong-password log
+
+Every wrong master password is noted in `attempts.json` in the data folder:
+the time, and where it was typed (the VeilForge window, a protected item's
+password prompt, "Restore everything"). **What was typed is never stored.**
+After the next unlock, VeilForge tells you once if there were wrong tries
+since your last unlock, leaving out the slips you just made yourself. The
+waiting time after wrong passwords counts all of them together and is not
+reset by closing the program.
+
+The log has to be writable without the master password, so it is plain text:
+someone who can write to your data folder can also empty it. Treat it as a
+hint that somebody tried, not as proof that nobody did.
+
 ## The map and the master password
 
 The only sensitive data VeilForge keeps is the **map**: original path, random

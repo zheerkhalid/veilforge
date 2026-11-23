@@ -26,6 +26,9 @@ pub struct Settings {
     pub tray_icon: bool,
     /// Global hotkey that opens the window, for example "Ctrl+Alt+V" (empty = none).
     pub hotkey: String,
+    /// Global hotkey that locks everything at once: temporarily open items
+    /// and VeilForge itself (empty = none).
+    pub lock_hotkey: String,
     /// Explorer right-click entries are installed.
     pub context_menu: bool,
     /// The "start with Windows" entry was switched on (the registry is the truth;
@@ -41,6 +44,9 @@ pub struct Settings {
     pub open_after_unlock: bool,
     /// Closing the window keeps VeilForge running (tray icon or hotkey).
     pub close_to_background: bool,
+    /// Closing the window to the tray also locks VeilForge, so that opening
+    /// it again asks for the master password.
+    pub lock_on_close: bool,
 }
 
 impl Default for Settings {
@@ -53,6 +59,7 @@ impl Default for Settings {
             neutral_title: false,
             tray_icon: true,
             hotkey: String::new(),
+            lock_hotkey: String::new(),
             context_menu: false,
             start_with_windows: false,
             default_mode: Mode::Hide,
@@ -60,6 +67,7 @@ impl Default for Settings {
             confirm_unlock: true,
             open_after_unlock: true,
             close_to_background: true,
+            lock_on_close: true,
         }
     }
 }
@@ -74,6 +82,17 @@ impl Settings {
         self.relock_idle_minutes = self.relock_idle_minutes.min(MAX_MINUTES);
         if self.hotkey.chars().count() > 40 {
             self.hotkey.clear();
+        }
+        if self.lock_hotkey.chars().count() > 40 {
+            self.lock_hotkey.clear();
+        }
+        // One key combination cannot do two things: opening wins.
+        let (open, lock) = (
+            crate::sys::parse_hotkey(&self.hotkey),
+            crate::sys::parse_hotkey(&self.lock_hotkey),
+        );
+        if open.is_some() && open == lock {
+            self.lock_hotkey.clear();
         }
     }
 
@@ -196,6 +215,21 @@ mod tests {
         assert_eq!(s.title(), "Files");
     }
 
+    #[test]
+    fn the_two_hotkeys_cannot_be_the_same() {
+        let mut s = Settings {
+            hotkey: "Ctrl+Alt+V".into(),
+            lock_hotkey: "ctrl + alt + v".into(),
+            ..Default::default()
+        };
+        s.sanitize();
+        assert_eq!(s.hotkey, "Ctrl+Alt+V");
+        assert!(s.lock_hotkey.is_empty());
+        s.lock_hotkey = "Ctrl+Alt+L".into();
+        s.sanitize();
+        assert_eq!(s.lock_hotkey, "Ctrl+Alt+L");
+    }
+
     /// The settings file has a fixed, reviewed set of fields. Adding a field
     /// means adding it here, which is the moment to check it is not a secret.
     #[test]
@@ -218,6 +252,8 @@ mod tests {
                 "context_menu",
                 "default_mode",
                 "hotkey",
+                "lock_hotkey",
+                "lock_on_close",
                 "neutral_title",
                 "open_after_unlock",
                 "relock_idle_minutes",

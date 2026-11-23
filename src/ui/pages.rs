@@ -92,6 +92,63 @@ fn minutes_row(ui: &mut Ui, title: &str, text: &str, value: &mut u32, options: &
     });
 }
 
+/// What to say next to a hotkey box.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HotkeyNote {
+    Empty,
+    Invalid,
+    /// The same combination as the other hotkey.
+    Same,
+    Active,
+    /// Windows refused it: another program has it.
+    Taken,
+}
+
+fn hotkey_note(text: &str, other: &str, status: Option<crate::sys::HotkeyStatus>) -> HotkeyNote {
+    if text.trim().is_empty() {
+        return HotkeyNote::Empty;
+    }
+    let Some(parsed) = crate::sys::parse_hotkey(text) else {
+        return HotkeyNote::Invalid;
+    };
+    if crate::sys::parse_hotkey(other) == Some(parsed) {
+        return HotkeyNote::Same;
+    }
+    match status {
+        Some(crate::sys::HotkeyStatus::Taken) => HotkeyNote::Taken,
+        _ => HotkeyNote::Active,
+    }
+}
+
+/// A settings row with a text box for a hotkey. Returns the text to keep in
+/// the settings when what was typed can be used.
+fn hotkey_row(
+    ui: &mut Ui,
+    title: &str,
+    explanation: &str,
+    text: &mut String,
+    other: &str,
+    status: Option<crate::sys::HotkeyStatus>,
+) -> Option<String> {
+    let p = pal(ui);
+    let note = hotkey_note(text, other, status);
+    setting_row(ui, title, explanation, |ui| {
+        widgets::text_input(ui, text, "None", 170.0);
+        let (label, color) = match note {
+            HotkeyNote::Empty => ("No hotkey".to_string(), p.faint),
+            HotkeyNote::Invalid => ("Not a valid hotkey".to_string(), p.danger),
+            HotkeyNote::Same => ("Same as the other hotkey".to_string(), p.danger),
+            HotkeyNote::Active => (Icon::DONE.with("Active"), p.ok),
+            HotkeyNote::Taken => ("Used by another program".to_string(), p.danger),
+        };
+        ui.label(RichText::new(label).size(12.5).color(color));
+    });
+    match note {
+        HotkeyNote::Empty | HotkeyNote::Active | HotkeyNote::Taken => Some(text.trim().to_string()),
+        HotkeyNote::Invalid | HotkeyNote::Same => None,
+    }
+}
+
 fn bullet(ui: &mut Ui, icon: Icon, color: egui::Color32, text: &str) {
     let p = pal(ui);
     ui.horizontal_top(|ui| {
@@ -411,6 +468,15 @@ impl Main {
         let p = pal(ui);
         page_header(ui, "Settings", "Saved automatically", |_| {});
         let (mut change_password, mut emergency, mut open_data) = (false, false, false);
+        let mut clear_log = false;
+        if self.attempt_log.is_none() {
+            self.attempt_log = Some(if sh.demo {
+                crate::demo::attempt_log(sh.now)
+            } else {
+                crate::attempts::Log::load(&sh.data_dir)
+            });
+        }
+        let attempt_log = self.attempt_log.clone().unwrap_or_default();
         let mut set_menu: Option<bool> = None;
         let mut set_startup: Option<bool> = None;
         egui::ScrollArea::vertical()
@@ -471,6 +537,13 @@ impl Main {
                         "Keep running when the window is closed",
                         "Needed for locking items again automatically. VeilForge stays reachable through its tray icon or hotkey.",
                         &mut sh.settings.close_to_background,
+                    );
+                    widgets::divider(ui);
+                    toggle_row(
+                        ui,
+                        "Lock VeilForge when its window is closed",
+                        "Closing the window to the tray also locks this list, so opening it again asks for the master password. Items you opened temporarily stay open until their own timers lock them.",
+                        &mut sh.settings.lock_on_close,
                     );
                 });
 
@@ -564,39 +637,43 @@ impl Main {
                         &mut sh.settings.tray_icon,
                     );
                     widgets::divider(ui);
+                    // What Windows answered when the hotkeys were registered.
+                    let status = |kind| sh.has_sys.then(|| crate::sys::hotkey_status(kind));
+                    let (show_status, lock_status) = (
+                        status(crate::sys::HotkeyKind::Show),
+                        status(crate::sys::HotkeyKind::Lock),
+                    );
                     let mut text = self
                         .hotkey_text
                         .clone()
                         .unwrap_or_else(|| sh.settings.hotkey.clone());
-                    let valid = text.trim().is_empty()
-                        || crate::sys::parse_hotkey(&text).is_some();
-                    setting_row(
+                    let mut lock_text = self
+                        .lock_hotkey_text
+                        .clone()
+                        .unwrap_or_else(|| sh.settings.lock_hotkey.clone());
+                    if let Some(keep) = hotkey_row(
                         ui,
                         "Hotkey that opens VeilForge",
                         "Works from anywhere while VeilForge is running. Needs Ctrl, Alt or Win plus a letter, digit or F key, for example Ctrl+Alt+V.",
-                        |ui| {
-                            widgets::text_input(ui, &mut text, "None", 170.0);
-                            if text.trim().is_empty() {
-                                ui.label(RichText::new("No hotkey").size(12.5).color(p.faint));
-                            } else if valid {
-                                ui.label(
-                                    RichText::new(Icon::DONE.with("Active"))
-                                        .size(12.5)
-                                        .color(p.ok),
-                                );
-                            } else {
-                                ui.label(
-                                    RichText::new("Not a valid hotkey")
-                                        .size(12.5)
-                                        .color(p.danger),
-                                );
-                            }
-                        },
-                    );
-                    if valid {
-                        sh.settings.hotkey = text.trim().to_string();
+                        &mut text,
+                        "",
+                        show_status,
+                    ) {
+                        sh.settings.hotkey = keep;
+                    }
+                    widgets::divider(ui);
+                    if let Some(keep) = hotkey_row(
+                        ui,
+                        "Hotkey that locks everything",
+                        "Locks every temporarily open item again and locks VeilForge, from anywhere, at once. For example Ctrl+Alt+L.",
+                        &mut lock_text,
+                        &sh.settings.hotkey,
+                        lock_status,
+                    ) {
+                        sh.settings.lock_hotkey = keep;
                     }
                     self.hotkey_text = Some(text);
+                    self.lock_hotkey_text = Some(lock_text);
                     if !sh.settings.tray_icon
                         && crate::sys::parse_hotkey(&sh.settings.hotkey).is_none()
                     {
@@ -637,6 +714,50 @@ impl Main {
                 });
 
                 widgets::card(ui, |ui| {
+                    widgets::section(ui, "Wrong passwords");
+                    let n = attempt_log.entries.len();
+                    setting_row(
+                        ui,
+                        "Wrong-password log",
+                        &match n {
+                            0 => "Every wrong master password is noted here: when, and where it was typed. Never what was typed. Nothing so far.".to_string(),
+                            1 => "1 wrong master password is on record. Only when and where it was typed is kept, never what was typed.".to_string(),
+                            n => format!("{n} wrong master passwords are on record. Only when and where they were typed is kept, never what was typed."),
+                        },
+                        |ui| {
+                            if widgets::ghost_button_enabled(ui, "Clear the log", n > 0).clicked() {
+                                clear_log = true;
+                            }
+                        },
+                    );
+                    // The newest few; the rest is in the file.
+                    for entry in attempt_log.entries.iter().rev().take(6) {
+                        widgets::left_row(ui, 22.0, |ui| {
+                            ui.label(
+                                RichText::new(Icon::WARNING.glyph())
+                                    .size(12.5)
+                                    .color(p.warn),
+                            );
+                            ui.label(
+                                RichText::new(crate::util::fmt_datetime(entry.at)).size(13.0),
+                            );
+                            ui.label(
+                                RichText::new(entry.place.label())
+                                    .size(13.0)
+                                    .color(p.muted),
+                            );
+                        });
+                    }
+                    if n > 6 {
+                        ui.label(
+                            RichText::new(format!("… and {} older", n - 6))
+                                .size(12.5)
+                                .color(p.faint),
+                        );
+                    }
+                });
+
+                widgets::card(ui, |ui| {
                     widgets::section(ui, "Data");
                     let dir = sh.data_dir.to_string_lossy().to_string();
                     setting_row(
@@ -655,8 +776,23 @@ impl Main {
                     );
                 });
                 ui.add_space(6.0);
+                if self.settings_at_end {
+                    ui.scroll_to_cursor(Some(Align::BOTTOM));
+                    if ui.input(|i| {
+                        i.raw_scroll_delta != egui::Vec2::ZERO || i.pointer.any_pressed()
+                    }) {
+                        self.settings_at_end = false;
+                    }
+                }
             });
 
+        if clear_log {
+            if !sh.demo {
+                crate::attempts::clear(&sh.data_dir);
+            }
+            self.attempt_log = Some(crate::attempts::Log::default());
+            sh.toast("The wrong-password log was cleared.", false);
+        }
         if change_password {
             self.dialog = Some(Dialog::change_password());
         }
@@ -850,5 +986,33 @@ impl Main {
                 });
                 ui.add_space(6.0);
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sys::HotkeyStatus;
+
+    #[test]
+    fn a_hotkey_box_says_what_is_wrong_with_it() {
+        assert_eq!(hotkey_note("  ", "", None), HotkeyNote::Empty);
+        assert_eq!(hotkey_note("Ctrl+", "", None), HotkeyNote::Invalid);
+        assert_eq!(hotkey_note("L", "", None), HotkeyNote::Invalid);
+        assert_eq!(
+            hotkey_note("ctrl+alt+v", "Ctrl+Alt+V", Some(HotkeyStatus::Active)),
+            HotkeyNote::Same
+        );
+        assert_eq!(
+            hotkey_note("Ctrl+Alt+L", "Ctrl+Alt+V", Some(HotkeyStatus::Active)),
+            HotkeyNote::Active
+        );
+        // Windows refused it: another program registered it first.
+        assert_eq!(
+            hotkey_note("Ctrl+Alt+L", "", Some(HotkeyStatus::Taken)),
+            HotkeyNote::Taken
+        );
+        // No background window (the demo): nothing to ask, shown as active.
+        assert_eq!(hotkey_note("Ctrl+Alt+L", "", None), HotkeyNote::Active);
     }
 }

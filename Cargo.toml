@@ -1,6 +1,6 @@
 [package]
 name = "veilforge"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "An easy file and folder locker for Windows: lock, hide or ask for a password on open, without encrypting anything"
 authors = ["Zheer Khalid (https://zheer.dev)"]

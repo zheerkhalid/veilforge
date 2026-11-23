@@ -63,6 +63,28 @@ fn parent_of(original: &str) -> &str {
     }
 }
 
+/// When a temporarily open item is protected again, in plain words.
+pub fn relock_sentence(idle_minutes: u32, on_session_lock: bool) -> String {
+    let idle = match idle_minutes {
+        0 => None,
+        1 => Some("after 1 minute without keyboard or mouse activity".to_string()),
+        60 => Some("after 1 hour without keyboard or mouse activity".to_string()),
+        n => Some(format!(
+            "after {n} minutes without keyboard or mouse activity"
+        )),
+    };
+    let session = on_session_lock.then_some("when Windows locks, sleeps or you sign out");
+    match (idle, session) {
+        (Some(a), Some(b)) => format!("On its own {a}, and {b}. Or with \"Lock again\"."),
+        (Some(a), None) => format!("On its own {a}. Or with \"Lock again\"."),
+        (None, Some(b)) => format!("On its own {b}. Or with \"Lock again\"."),
+        (None, None) => {
+            "Only when you choose \"Lock again\" or \"Lock all\": the automatic timers are switched off in Settings."
+                .to_string()
+        }
+    }
+}
+
 fn count_text(n: usize) -> String {
     if n == 1 {
         "1 item".to_string()
@@ -312,6 +334,45 @@ impl Main {
         }
         if unlock_all {
             self.ask_unlock_all();
+        }
+
+        // Wrong master passwords typed while the user was away: told once.
+        if let Some(text) = self.attempt_notice.clone() {
+            let mut dismiss = false;
+            let mut show_log = false;
+            Frame::new()
+                .fill(p.warn.gamma_multiply(0.12))
+                .stroke(Stroke::new(1.0_f32, p.warn.gamma_multiply(0.5)))
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::symmetric(12, 6))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(Icon::WARNING.glyph()).color(p.warn));
+                        let room = (ui.available_width() - 190.0).max(120.0);
+                        ui.vertical(|ui| {
+                            ui.set_width(room);
+                            ui.add_space(5.0);
+                            widgets::text(ui, &text, 13.5, false, p.text);
+                            ui.add_space(3.0);
+                        });
+                        if widgets::ghost_button(ui, "See the log").clicked() {
+                            show_log = true;
+                        }
+                        if widgets::ghost_button(ui, "OK").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                });
+            ui.add_space(2.0);
+            if show_log {
+                self.tab = super::main_view::Tab::Settings;
+                self.attempt_log = None;
+                self.settings_at_end = true;
+            }
+            if dismiss || show_log {
+                self.attempt_notice = None;
+            }
         }
 
         if total == 0 {
@@ -982,7 +1043,7 @@ impl Main {
             widgets::kind_tile(ui, rect, &item.name, item.kind == Kind::Folder);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                ui.add(egui::Label::new(RichText::new(&item.name).font(semibold(17.0))).wrap());
+                widgets::text(ui, &item.name, 17.0, true, p.text);
                 ui.label(RichText::new(kind_text(&item)).color(p.muted));
             });
         });
@@ -1063,6 +1124,16 @@ impl Main {
                     _ => state.label().to_string(),
                 };
                 widgets::field(ui, "State", &state_text);
+                if state == State::Open {
+                    widgets::field(
+                        ui,
+                        "Locks again",
+                        &relock_sentence(
+                            sh.settings.relock_idle_minutes,
+                            sh.settings.relock_on_session_lock,
+                        ),
+                    );
+                }
                 let size = match item.kind {
                     Kind::File => human_size(item.size),
                     Kind::Folder => format!(
@@ -1201,6 +1272,253 @@ mod tests {
         assert!(wide.location > 0.0 && wide.date > 0.0);
         let narrow = Columns::for_width(672.0);
         assert_eq!(narrow.location, 0.0);
+    }
+
+    #[test]
+    fn relock_sentences_follow_the_settings() {
+        assert_eq!(
+            relock_sentence(15, true),
+            "On its own after 15 minutes without keyboard or mouse activity, and when Windows locks, sleeps or you sign out. Or with \"Lock again\"."
+        );
+        assert!(relock_sentence(60, false).starts_with("On its own after 1 hour without"));
+        assert!(relock_sentence(0, true).starts_with("On its own when Windows locks"));
+        assert!(relock_sentence(0, false).starts_with("Only when you choose"));
+    }
+
+    // ----------------------------------------------------------------------------------
+    // The main window's buttons, without a window: the same functions the
+    // clicks call, on generated files in a sandbox in the temp folder.
+    // ----------------------------------------------------------------------------------
+
+    use super::super::app::Msg;
+    use super::super::ops::Snapshot;
+    use crate::engine::cleanup::SandboxGuard;
+    use crate::engine::{Env, Vault};
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc::Receiver;
+    use std::time::Duration;
+
+    const PW: &str = "a long master password";
+
+    /// Delivers worker results to the window state until `done` says so.
+    fn pump(
+        main: &mut Main,
+        sh: &mut Shared,
+        ctx: &egui::Context,
+        rx: &Receiver<Msg>,
+        done: impl Fn(&Main) -> bool,
+    ) {
+        while !done(main) {
+            let msg = rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the worker answers");
+            main.message(ctx, sh, msg);
+        }
+    }
+
+    fn idle(main: &Main) -> bool {
+        main.job.is_none()
+    }
+
+    fn id_of(main: &Main, name: &str) -> String {
+        main.snap
+            .items
+            .iter()
+            .find(|i| i.name == name)
+            .unwrap_or_else(|| panic!("{name} is in the list"))
+            .id
+            .clone()
+    }
+
+    fn confirm(main: &mut Main, sh: &mut Shared, ctx: &egui::Context) {
+        match main.dialog.take() {
+            Some(Dialog::Confirm { action, .. }) => {
+                let op = match action {
+                    ConfirmAction::Release(ids) => Op::Release(ids),
+                    ConfirmAction::OpenTemp(ids) => Op::OpenTemp(ids),
+                };
+                main.start(ctx, sh, op);
+            }
+            _ => panic!("a confirmation was expected"),
+        }
+    }
+
+    #[test]
+    fn the_main_windows_buttons_protect_unlock_lock_and_restore() {
+        let sandbox = SandboxGuard::new("buttons");
+        let env = Env::sandbox(sandbox.path());
+        let work = sandbox.path().join("work");
+        let folder = work.join("Family papers");
+        std::fs::create_dir_all(folder.join("inner")).unwrap();
+        std::fs::write(folder.join("inner").join("scan.jpg"), [1u8, 2, 3]).unwrap();
+        std::fs::write(folder.join("list.txt"), b"list").unwrap();
+        let letter = work.join("Letter.txt");
+        std::fs::write(&letter, b"letter").unwrap();
+        // "Documents" in Kurdish: right-to-left names go through every step too.
+        let kurdish = work.join("بەڵگەنامەکان ڕاپۆرت.txt");
+        std::fs::write(&kurdish, "ناوەڕۆک".as_bytes()).unwrap();
+        let check = |folder: &Path, letter: &Path, kurdish: &Path| {
+            assert_eq!(std::fs::read(folder.join("list.txt")).unwrap(), b"list");
+            assert_eq!(
+                std::fs::read(folder.join("inner").join("scan.jpg")).unwrap(),
+                [1u8, 2, 3]
+            );
+            assert_eq!(std::fs::read(letter).unwrap(), b"letter");
+            assert_eq!(std::fs::read(kurdish).unwrap(), "ناوەڕۆک".as_bytes());
+        };
+
+        let (mut sh, rx) = Shared::for_test(env.clone());
+        let ctx = egui::Context::default();
+        let vault = Vault::create(env.clone(), PW).unwrap();
+        let mut main = Main::new(Snapshot::of(&vault), None);
+        *sh.core.lock_vault() = Some(vault);
+        sh.core
+            .ui_locked
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // "Add files" / a drop: the dialog opens and the engine looks at each path.
+        main.offer_protect(&ctx, &mut sh, vec![folder.clone(), letter.clone()]);
+        // A second drop while the dialog is open joins the list; a path that
+        // is already in it is not added twice.
+        let added = main.add_to_protect(
+            &ctx,
+            &sh,
+            vec![
+                kurdish.clone(),
+                PathBuf::from(letter.to_string_lossy().to_uppercase()),
+            ],
+        );
+        assert_eq!(added, 1);
+        let checked = |main: &Main| match &main.dialog {
+            Some(Dialog::Protect(dlg)) => dlg.rows.iter().all(|r| r.pre.is_some()),
+            _ => true,
+        };
+        pump(&mut main, &mut sh, &ctx, &rx, checked);
+        let plan = match main.dialog.take() {
+            Some(Dialog::Protect(dlg)) => {
+                assert_eq!(dlg.rows.len(), 3);
+                dlg.plan()
+            }
+            _ => panic!("the protect dialog is open"),
+        };
+        assert_eq!(plan.len(), 3, "nothing in the sandbox is refused");
+
+        // "Protect": everything is hidden (the usual way) and listed.
+        main.start(&ctx, &mut sh, Op::Protect(plan));
+        assert!(main.busy());
+        pump(&mut main, &mut sh, &ctx, &rx, idle);
+        assert!(main.dialog.is_none(), "no problems to report");
+        assert_eq!(main.snap.items.len(), 3);
+        assert!(main
+            .snap
+            .items
+            .iter()
+            .all(|i| main.state_of(&i.id) == State::Locked));
+        assert!(!folder.exists() && !letter.exists() && !kurdish.exists());
+        assert_eq!(main.open_count(), 0);
+        let (folder_id, letter_id, kurdish_id) = (
+            id_of(&main, "Family papers"),
+            id_of(&main, "Letter.txt"),
+            id_of(&main, "بەڵگەنامەکان ڕاپۆرت.txt"),
+        );
+        // Search finds the Kurdish name by a part of it.
+        main.search = "ڕاپۆرت".to_string();
+        assert_eq!(main.visible_items().len(), 1);
+        main.search.clear();
+
+        // The quick action of a locked row: unlock temporarily.
+        main.quick_action(&ctx, &mut sh, &kurdish_id);
+        pump(&mut main, &mut sh, &ctx, &rx, idle);
+        assert_eq!(main.state_of(&kurdish_id), State::Open);
+        assert_eq!(std::fs::read(&kurdish).unwrap(), "ناوەڕۆک".as_bytes());
+        assert_eq!(main.open_count(), 1);
+        // The same button on an open row: lock again.
+        main.quick_action(&ctx, &mut sh, &kurdish_id);
+        pump(&mut main, &mut sh, &ctx, &rx, idle);
+        assert_eq!(main.state_of(&kurdish_id), State::Locked);
+        assert!(!kurdish.exists());
+
+        // "Unlock all" asks first, then everything is back for now.
+        main.ask_unlock_all();
+        confirm(&mut main, &mut sh, &ctx);
+        pump(&mut main, &mut sh, &ctx, &rx, idle);
+        assert_eq!(main.open_count(), 3);
+        check(&folder, &letter, &kurdish);
+        // "Lock all".
+        main.start(&ctx, &mut sh, Op::RelockAll);
+        pump(&mut main, &mut sh, &ctx, &rx, idle);
+        assert_eq!(main.open_count(), 0);
+        assert!(!folder.exists() && !letter.exists() && !kurdish.exists());
+
+        // "Unlock permanently" asks first (the default), then forgets the item.
+        main.ask_release(&ctx, &mut sh, vec![letter_id.clone()]);
+        confirm(&mut main, &mut sh, &ctx);
+        pump(&mut main, &mut sh, &ctx, &rx, idle);
+        assert_eq!(std::fs::read(&letter).unwrap(), b"letter");
+        assert!(main.snap.item(&letter_id).is_none());
+        assert_eq!(main.snap.items.len(), 2);
+
+        // Setting a group from the details panel.
+        main.start(
+            &ctx,
+            &mut sh,
+            Op::SetGroup(vec![folder_id.clone()], "خێزان".into()),
+        );
+        pump(&mut main, &mut sh, &ctx, &rx, idle);
+        assert_eq!(main.snap.groups, vec!["خێزان".to_string()]);
+
+        // Panic restore with a wrong password: refused, counted and logged.
+        main.start(
+            &ctx,
+            &mut sh,
+            Op::PanicRestore(zeroize::Zeroizing::new("not the password".to_string())),
+        );
+        pump(&mut main, &mut sh, &ctx, &rx, idle);
+        assert!(matches!(main.dialog, Some(Dialog::Panic(_))));
+        assert_eq!(main.attempts.failures(), 1);
+        assert_eq!(main.snap.items.len(), 2, "nothing was restored");
+        let log = crate::attempts::Log::load(&env.data_dir);
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.entries[0].place, crate::attempts::Place::Restore);
+        main.dialog = None;
+
+        // With the right one: everything is back exactly, nothing is listed.
+        main.start(
+            &ctx,
+            &mut sh,
+            Op::PanicRestore(zeroize::Zeroizing::new(PW.to_string())),
+        );
+        pump(&mut main, &mut sh, &ctx, &rx, idle);
+        assert!(matches!(main.dialog, Some(Dialog::Results(_))));
+        assert!(main.snap.items.is_empty());
+        check(&folder, &letter, &kurdish);
+        let _ = (folder_id, kurdish_id);
+
+        // Nothing is left behind in the holding folder.
+        drop(sh);
+        let hold = sandbox.path().join("hold");
+        let left: Vec<_> = walk(&hold);
+        assert!(left.is_empty(), "left in the holding folder: {left:?}");
+    }
+
+    /// Every file below `dir` (folders that cannot be listed count as a file).
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            if dir.exists() {
+                out.push(dir.to_path_buf());
+            }
+            return out;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+        out
     }
 
     #[test]

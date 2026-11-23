@@ -1,7 +1,11 @@
 ; VeilForge installer (Inno Setup 6). Per-user: no administrator rights needed.
 
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.1.0"
+#endif
+; Where cargo put the build (scripts/package.ps1 passes CARGO_TARGET_DIR).
+#ifndef TargetDir
+  #define TargetDir "..\target"
 #endif
 
 [Setup]
@@ -21,7 +25,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
 OutputBaseFilename=VeilForge-Setup
-SetupIconFile=..\target\veilforge.ico
+SetupIconFile={#TargetDir}\veilforge.ico
 UninstallDisplayIcon={app}\VeilForge.exe
 Compression=lzma2/ultra64
 SolidCompression=yes
@@ -38,9 +42,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "contextmenu"; Description: "Add ""Lock with VeilForge"" and ""Unlock with VeilForge"" to the Explorer right-click menu"; GroupDescription: "Explorer:"
 
 [Files]
-Source: "..\target\release\VeilForge.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#TargetDir}\release\VeilForge.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "..\docs\HOW-IT-WORKS.md"; DestDir: "{app}"; DestName: "HOW-IT-WORKS.txt"; Flags: ignoreversion
+Source: "..\CHANGELOG.md"; DestDir: "{app}"; DestName: "CHANGELOG.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\VeilForge"; Filename: "{app}\VeilForge.exe"

@@ -174,12 +174,7 @@ fn results_ui(ui: &mut Ui, dlg: &ResultsDlg) -> (bool, bool) {
                             ui.label(RichText::new(icon.glyph()).color(color));
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 1.0;
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&line.name).font(semibold(14.0)),
-                                    )
-                                    .wrap(),
-                                );
+                                widgets::text(ui, &line.name, 14.0, true, p.text);
                                 match &line.result {
                                     Ok(text) => {
                                         let text = match (dlg.kind, text.is_empty()) {
@@ -189,25 +184,13 @@ fn results_ui(ui: &mut Ui, dlg: &ResultsDlg) -> (bool, bool) {
                                             (_, true) => "Done".to_string(),
                                             (_, false) => text.clone(),
                                         };
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(text).size(13.0).color(p.muted),
-                                            )
-                                            .wrap(),
-                                        );
+                                        widgets::text(ui, &text, 13.0, false, p.muted);
                                     }
                                     Err(e) => {
                                         let (text, detail) = ops::explain(e);
-                                        ui.add(
-                                            egui::Label::new(RichText::new(text).size(13.0)).wrap(),
-                                        );
+                                        widgets::text(ui, &text, 13.0, false, p.text);
                                         if !detail.is_empty() {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(detail).size(12.5).color(p.faint),
-                                                )
-                                                .wrap(),
-                                            );
+                                            widgets::text(ui, &detail, 12.5, false, p.faint);
                                         }
                                     }
                                 }
@@ -616,7 +599,9 @@ impl Main {
                 } else {
                     &progress.what
                 };
-                ui.add(egui::Label::new(RichText::new(what).size(13.0).color(p.muted)).truncate());
+                // One line, cut off; a Kurdish or Arabic name is drawn by Windows.
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::hover());
+                widgets::text_in(ui, rect, what, super::theme::regular(13.0), p.muted);
             });
     }
 }

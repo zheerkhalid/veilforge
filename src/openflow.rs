@@ -7,12 +7,14 @@
 //!   showing it is closed (folders);
 //! * nobody touched keyboard or mouse for the configured idle time;
 //! * Windows is locked, goes to sleep, or the user signs out;
-//! * "Lock now" is chosen from the tray icon;
+//! * "Lock now" is chosen from the tray icon, the lock hotkey is pressed in
+//!   the main program, or `VeilForge.exe --lock-now` is run;
 //! * the main window locked it already.
 //!
 //! The parts without a window ([`resolve`], [`Session`], [`decide`]) are plain
 //! functions so that tests and `--selftest` can drive the same code.
 
+use crate::attempts::Place;
 use crate::engine::{Env, Error, Vault};
 use crate::model::{Kind, State};
 use crate::settings::Settings;
@@ -348,6 +350,19 @@ pub fn folder_window_open(folder: &Path) -> Option<bool> {
 // The helper process
 // --------------------------------------------------------------------------------------
 
+/// Keeps the wrong-password log: a wrong master password is written down
+/// (when and where, never what was typed), a correct one ends the streak.
+/// Other failures say nothing about the password and are not logged.
+pub fn note_attempt<T>(data_dir: &Path, result: &Result<T, Error>, place: Place) {
+    match result {
+        Err(Error::WrongPassword) => {
+            crate::attempts::record_failure(data_dir, place, crate::util::now());
+        }
+        Err(_) => {}
+        Ok(_) => crate::attempts::record_success_elsewhere(data_dir),
+    }
+}
+
 /// Runs the whole flow. Returns the process exit code.
 pub fn run(target: Target, icon: egui::IconData) -> i32 {
     let env = Env::real();
@@ -375,8 +390,9 @@ pub fn run(target: Target, icon: egui::IconData) -> i32 {
         spec,
         icon,
         Box::new(move |password| {
-            let session =
-                Session::begin(submit_env.clone(), password, &target).map_err(|e| e.to_string())?;
+            let result = Session::begin(submit_env.clone(), password, &target);
+            note_attempt(&submit_env.data_dir, &result, Place::StandIn);
+            let session = result.map_err(|e| e.to_string())?;
             if let Ok(mut g) = submit_slot.lock() {
                 *g = Some(session);
             }
@@ -429,7 +445,7 @@ fn watch_and_lock(session: &mut Session, launched: Launched, settings: &Settings
         tick += 1;
         while let Ok(event) = rx.try_recv() {
             match event {
-                SysEvent::TrayLock | SysEvent::TrayExit => seen.lock_now = true,
+                SysEvent::TrayLock | SysEvent::TrayExit | SysEvent::LockAll => seen.lock_now = true,
                 SysEvent::SessionLocked | SysEvent::Suspending | SysEvent::SessionEnding => {
                     seen.session_event = true
                 }
@@ -575,6 +591,27 @@ mod tests {
         o.still_open = false;
         o.lock_now = true;
         assert_eq!(decide(&o, &POLICY), Some(Stop::AlreadyLocked));
+    }
+
+    #[test]
+    fn only_wrong_passwords_are_written_to_the_log() {
+        let dir = crate::util::unique_temp_dir("noteattempt");
+        let wrong: Result<(), Error> = Err(Error::WrongPassword);
+        let other: Result<(), Error> = Err(Error::InUse("open in a program".into()));
+        note_attempt(&dir, &other, Place::StandIn);
+        assert!(crate::attempts::Log::load(&dir).entries.is_empty());
+        note_attempt(&dir, &wrong, Place::StandIn);
+        note_attempt(&dir, &wrong, Place::Restore);
+        let log = crate::attempts::Log::load(&dir);
+        assert_eq!(log.streak, 2);
+        assert_eq!(log.entries[1].place, Place::Restore);
+        // Another problem in between does not end the streak; success does.
+        note_attempt(&dir, &other, Place::StandIn);
+        assert_eq!(crate::attempts::Log::load(&dir).streak, 2);
+        note_attempt(&dir, &Ok(()), Place::StandIn);
+        let log = crate::attempts::Log::load(&dir);
+        assert_eq!((log.streak, log.entries.len()), (0, 2));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

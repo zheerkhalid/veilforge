@@ -5,7 +5,7 @@
 //! window (the `--open` helper).
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Condvar, Mutex};
 use windows::core::{w, HSTRING, PCWSTR};
@@ -360,6 +360,35 @@ pub fn first_instance(name: &str) -> Option<AppMutex> {
     }
 }
 
+/// Asks every running VeilForge process of this user to lock everything now:
+/// the main window (if `include_main`) and the helpers that keep an "ask on
+/// open" item open. Returns how many were asked.
+pub fn broadcast_lock_now(include_main: bool) -> usize {
+    let mut asked = 0;
+    let titles: &[PCWSTR] = if include_main {
+        &[MAIN_TITLE, HELPER_TITLE]
+    } else {
+        &[HELPER_TITLE]
+    };
+    for title in titles {
+        let mut after = HWND::default();
+        // SAFETY: plain Win32 calls with constant strings; a window that
+        // disappears in between only makes the post fail.
+        unsafe {
+            while let Ok(window) = FindWindowExW(HWND::default(), after, SYS_CLASS, *title) {
+                if window.is_invalid() {
+                    break;
+                }
+                if PostMessageW(window, WM_LOCK_NOW, WPARAM(0), LPARAM(0)).is_ok() {
+                    asked += 1;
+                }
+                after = window;
+            }
+        }
+    }
+    asked
+}
+
 /// Asks the VeilForge window that is already running to show itself.
 /// Returns false when none was found.
 pub fn signal_running_instance() -> bool {
@@ -441,8 +470,11 @@ pub enum SysEvent {
     Suspending,
     /// The user is signing out, or Windows is shutting down or restarting.
     SessionEnding,
-    /// The global hotkey was pressed.
+    /// The global hotkey that opens the window was pressed.
     Hotkey,
+    /// "Lock everything now": the lock hotkey, `VeilForge.exe --lock-now`, or
+    /// another VeilForge process passing on its own "Lock now".
+    LockAll,
     /// "Open" in the tray menu, a click on the tray icon, or a second start
     /// of the program. The main window (if any) has already been shown.
     TrayShow,
@@ -456,7 +488,9 @@ const WM_SET_TRAY: u32 = WM_APP + 3;
 const WM_QUIT_THREAD: u32 = WM_APP + 4;
 const WM_SET_TITLE: u32 = WM_APP + 5;
 const WM_SHOW_MAIN: u32 = WM_APP + 6;
+const WM_LOCK_NOW: u32 = WM_APP + 7;
 const HOTKEY_ID: i32 = 1;
+const LOCK_HOTKEY_ID: i32 = 2;
 const MENU_SHOW: usize = 1;
 const MENU_LOCK: usize = 2;
 const MENU_EXIT: usize = 3;
@@ -473,6 +507,40 @@ struct State {
     main_window: isize,
     tray: bool,
     title: String,
+    /// What the tray icon says when the mouse rests on it (empty: the title).
+    tip: String,
+}
+
+/// Which of the two global hotkeys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HotkeyKind {
+    /// Opens the window.
+    Show,
+    /// Locks everything.
+    Lock,
+}
+
+/// What Windows said when a hotkey was registered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HotkeyStatus {
+    /// No hotkey is set.
+    None,
+    Active,
+    /// Windows refused it: another program already uses this combination.
+    Taken,
+}
+
+static HOTKEY_STATUS: [AtomicU8; 2] = [AtomicU8::new(0), AtomicU8::new(0)];
+
+/// The result of the last [`SysWindow::set_hotkey`] for this hotkey. The
+/// registration happens on the background thread, so right after a change
+/// this may still be the old answer for a moment.
+pub fn hotkey_status(kind: HotkeyKind) -> HotkeyStatus {
+    match HOTKEY_STATUS[kind as usize].load(Ordering::SeqCst) {
+        1 => HotkeyStatus::Active,
+        2 => HotkeyStatus::Taken,
+        _ => HotkeyStatus::None,
+    }
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -546,7 +614,13 @@ unsafe fn tray_data(window: HWND) -> NOTIFYICONDATAW {
         .or_else(|_| LoadIconW(HINSTANCE::default(), IDI_APPLICATION))
         .unwrap_or_default();
     let limit = data.szTip.len() - 1;
-    for (i, c) in state_title().encode_utf16().take(limit).enumerate() {
+    let tip = STATE
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.tip.clone()))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(state_title);
+    for (i, c) in tip.encode_utf16().take(limit).enumerate() {
         data.szTip[i] = c;
     }
     data
@@ -649,7 +723,15 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_HOTKEY => {
-            emit(SysEvent::Hotkey);
+            emit(if wparam.0 as i32 == LOCK_HOTKEY_ID {
+                SysEvent::LockAll
+            } else {
+                SysEvent::Hotkey
+            });
+            LRESULT(0)
+        }
+        WM_LOCK_NOW => {
+            emit(SysEvent::LockAll);
             LRESULT(0)
         }
         WM_SHOW_MAIN => {
@@ -665,14 +747,30 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_SET_HOTKEY => {
-            let _ = UnregisterHotKey(window, HOTKEY_ID);
-            if lparam.0 != 0 {
-                let _ = RegisterHotKey(
-                    window,
-                    HOTKEY_ID,
-                    HOT_KEY_MODIFIERS(wparam.0 as u32) | MOD_NOREPEAT,
-                    lparam.0 as u32,
-                );
+            // wparam: the modifiers, and bit 16 for the lock hotkey.
+            let lock = wparam.0 & 0x1_0000 != 0;
+            let id = if lock { LOCK_HOTKEY_ID } else { HOTKEY_ID };
+            let _ = UnregisterHotKey(window, id);
+            let status = if lparam.0 == 0 {
+                0
+            } else if RegisterHotKey(
+                window,
+                id,
+                HOT_KEY_MODIFIERS((wparam.0 & 0xFFFF) as u32) | MOD_NOREPEAT,
+                lparam.0 as u32,
+            )
+            .is_ok()
+            {
+                1
+            } else {
+                2
+            };
+            HOTKEY_STATUS[usize::from(lock)].store(status, Ordering::SeqCst);
+            // The window shows the answer.
+            if let Ok(guard) = STATE.lock() {
+                if let Some(s) = guard.as_ref() {
+                    (s.wake)();
+                }
             }
             LRESULT(0)
         }
@@ -694,6 +792,7 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_QUIT_THREAD => {
             let _ = UnregisterHotKey(window, HOTKEY_ID);
+            let _ = UnregisterHotKey(window, LOCK_HOTKEY_ID);
             set_tray(window, false);
             let _ = WTSUnRegisterSessionNotification(window);
             let _ = DestroyWindow(window);
@@ -729,6 +828,7 @@ impl SysWindow {
                 main_window,
                 tray: false,
                 title: "VeilForge".into(),
+                tip: String::new(),
             });
         }
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<isize>();
@@ -791,12 +891,35 @@ impl SysWindow {
         }
     }
 
-    /// Registers (or with `None`, removes) the global hotkey.
-    pub fn set_hotkey(&self, hotkey: Option<Hotkey>) {
+    /// Registers (or with `None`, removes) one of the two global hotkeys.
+    /// [`hotkey_status`] says a moment later whether Windows accepted it.
+    pub fn set_hotkey(&self, kind: HotkeyKind, hotkey: Option<Hotkey>) {
+        let flag = match kind {
+            HotkeyKind::Show => 0,
+            HotkeyKind::Lock => 0x1_0000,
+        };
         match hotkey {
-            Some(h) => self.post(WM_SET_HOTKEY, h.modifiers as usize, h.vk as isize),
-            None => self.post(WM_SET_HOTKEY, 0, 0),
+            Some(h) => self.post(
+                WM_SET_HOTKEY,
+                (h.modifiers as usize & 0xFFFF) | flag,
+                h.vk as isize,
+            ),
+            None => self.post(WM_SET_HOTKEY, flag, 0),
         }
+    }
+
+    /// What the tray icon says when the mouse rests on it, for example
+    /// "VeilForge: 2 items open". Empty: just the title.
+    pub fn set_tray_tip(&self, text: &str) {
+        if let Ok(mut g) = STATE.lock() {
+            if let Some(s) = g.as_mut() {
+                if s.tip == text {
+                    return;
+                }
+                s.tip = text.to_string();
+            }
+        }
+        self.post(WM_SET_TITLE, 0, 0);
     }
 
     pub fn set_tray(&self, on: bool) {
@@ -887,6 +1010,79 @@ mod tests {
         set_startup(&key, false, exe).unwrap();
         assert!(!startup_enabled(&key));
         hkcu.delete_subkey_all(&key).unwrap();
+    }
+
+    /// The background window, driven by the same messages Windows sends:
+    /// a session lock, sleep, the two hotkeys, "lock everything now".
+    /// Nothing is locked here; the test only looks at what is reported.
+    #[test]
+    fn the_background_window_reports_lock_sleep_and_hotkeys() {
+        use std::time::Duration;
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Without a desktop (a service session) there is no window to test.
+        let Some(win) = SysWindow::start(0, tx, Box::new(|| {})) else {
+            return;
+        };
+        let next = |rx: &std::sync::mpsc::Receiver<SysEvent>| {
+            rx.recv_timeout(Duration::from_secs(10)).expect("an event")
+        };
+        // WTS_SESSION_LOCK, then WTS_SESSION_UNLOCK (which means nothing here).
+        win.post(WM_WTSSESSION_CHANGE, 7, 0);
+        assert_eq!(next(&rx), SysEvent::SessionLocked);
+        win.post(WM_WTSSESSION_CHANGE, 8, 0);
+        // PBT_APMSUSPEND, then PBT_APMRESUMEAUTOMATIC (ignored).
+        win.post(WM_POWERBROADCAST, 4, 0);
+        assert_eq!(next(&rx), SysEvent::Suspending);
+        win.post(WM_POWERBROADCAST, 18, 0);
+        win.post(WM_HOTKEY, HOTKEY_ID as usize, 0);
+        assert_eq!(next(&rx), SysEvent::Hotkey);
+        win.post(WM_HOTKEY, LOCK_HOTKEY_ID as usize, 0);
+        assert_eq!(next(&rx), SysEvent::LockAll);
+        win.post(WM_LOCK_NOW, 0, 0);
+        assert_eq!(next(&rx), SysEvent::LockAll);
+
+        // Registering: a combination nobody uses, held for a moment only.
+        let wait_for = |kind: HotkeyKind, wanted: &[HotkeyStatus]| {
+            let started = std::time::Instant::now();
+            loop {
+                let status = hotkey_status(kind);
+                if wanted.contains(&status) || started.elapsed() > Duration::from_secs(10) {
+                    return status;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        assert_eq!(hotkey_status(HotkeyKind::Show), HotkeyStatus::None);
+        let combo = parse_hotkey("Ctrl+Alt+Shift+Win+F23").unwrap();
+        win.set_hotkey(HotkeyKind::Show, Some(combo));
+        let first = wait_for(
+            HotkeyKind::Show,
+            &[HotkeyStatus::Active, HotkeyStatus::Taken],
+        );
+        if first == HotkeyStatus::Active {
+            // The same combination a second time is refused, and it says so.
+            win.set_hotkey(HotkeyKind::Lock, Some(combo));
+            assert_eq!(
+                wait_for(
+                    HotkeyKind::Lock,
+                    &[HotkeyStatus::Active, HotkeyStatus::Taken]
+                ),
+                HotkeyStatus::Taken
+            );
+        }
+        win.set_hotkey(HotkeyKind::Show, None);
+        win.set_hotkey(HotkeyKind::Lock, None);
+        assert_eq!(
+            wait_for(HotkeyKind::Show, &[HotkeyStatus::None]),
+            HotkeyStatus::None
+        );
+        assert_eq!(
+            wait_for(HotkeyKind::Lock, &[HotkeyStatus::None]),
+            HotkeyStatus::None
+        );
+        // No more events arrived (the two ignored messages said nothing).
+        assert!(rx.try_recv().is_err());
+        drop(win);
     }
 
     #[test]

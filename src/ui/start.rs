@@ -124,6 +124,17 @@ pub struct Attempts {
 }
 
 impl Attempts {
+    /// Carries on after `failures` wrong passwords counted earlier (before
+    /// the program was started again, or in another window), so that closing
+    /// and reopening never resets the delay. There is no wait to begin with:
+    /// only the next wrong try gets the longer pause.
+    pub fn resumed(failures: u32) -> Attempts {
+        Attempts {
+            failures: failures.min(64),
+            retry_at: None,
+        }
+    }
+
     pub fn failed(&mut self) {
         self.failures += 1;
         let delay = retry_delay(self.failures);
@@ -488,6 +499,12 @@ pub struct UnlockState {
     focus: bool,
     /// "Rebuild from recovery copies" instead of a normal unlock.
     rebuild: bool,
+    /// Wrong passwords typed at this very screen (the user's own slips).
+    own_failures: u32,
+    /// The count of earlier wrong passwords has been read from the log.
+    resumed: bool,
+    /// "Lock them now" is running.
+    locking: bool,
 }
 
 impl UnlockState {
@@ -501,7 +518,15 @@ impl UnlockState {
             attempt: 0,
             focus: true,
             rebuild: false,
+            own_failures: 0,
+            resumed: false,
+            locking: false,
         }
+    }
+
+    /// How many wrong passwords were typed at this screen since it appeared.
+    pub fn own_failures(&self) -> u32 {
+        self.own_failures
     }
 
     pub fn rebuild() -> Self {
@@ -530,12 +555,83 @@ impl UnlockState {
             Err(e) => {
                 if matches!(e, Error::WrongPassword) {
                     self.attempts.failed();
+                    self.own_failures += 1;
                 }
                 self.error = Some(e.to_string());
                 self.focus = true;
                 None
             }
         }
+    }
+
+    /// Items that are still temporarily open while the window is locked:
+    /// says so, and locks them again without asking for the password
+    /// (locking never needs it).
+    fn open_items_ui(&mut self, ui: &mut Ui, sh: &mut Shared, width: f32) {
+        let open = match &sh.demo_keep {
+            // The demo: the invented list that was just "locked".
+            Some(demo) if sh.demo => demo
+                .states
+                .values()
+                .filter(|s| **s == crate::model::State::Open)
+                .count(),
+            _ => sh.core.open_items(),
+        };
+        if open == 0 {
+            self.locking = false;
+            return;
+        }
+        let p = pal(ui);
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(1000));
+        ui.add_space(10.0);
+        Frame::new()
+            .fill(p.warn.gamma_multiply(0.12))
+            .stroke(Stroke::new(1.0_f32, p.warn.gamma_multiply(0.5)))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::symmetric(12, 9))
+            .show(ui, |ui| {
+                ui.set_width(width - 24.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(Icon::UNLOCK.with(&if open == 1 {
+                            "1 item is still temporarily open.".to_string()
+                        } else {
+                            format!("{open} items are still temporarily open.")
+                        }))
+                        .size(13.5),
+                    )
+                    .wrap(),
+                );
+                widgets::left_row(ui, 32.0, |ui| {
+                    if self.locking {
+                        ui.add(egui::Spinner::new().size(16.0).color(p.warn));
+                        ui.label(RichText::new("Locking…").size(13.0).color(p.muted));
+                    } else if widgets::ghost_button(
+                        ui,
+                        &Icon::LOCK.with(if open == 1 {
+                            "Lock it now"
+                        } else {
+                            "Lock them now"
+                        }),
+                    )
+                    .on_hover_text("Protects them again. No password is needed for locking.")
+                    .clicked()
+                    {
+                        if let Some(demo) = sh.demo_keep.as_mut().filter(|_| sh.demo) {
+                            demo.run(super::ops::Op::RelockAll);
+                            sh.toast("Demo: the invented item was locked again.", false);
+                            return;
+                        }
+                        self.locking = true;
+                        let core = sh.core.clone();
+                        sh.spawn(ui.ctx(), move || {
+                            let (text, error) = core.lock_everything("from the lock screen");
+                            super::app::Msg::Background(text, error)
+                        });
+                    }
+                });
+            });
     }
 
     fn submit(&mut self, ctx: &egui::Context, sh: &mut Shared) -> Option<Go> {
@@ -570,6 +666,13 @@ impl UnlockState {
     ) -> Option<Go> {
         let mut go = None;
         let p = pal_ctx(ctx);
+        if !self.resumed {
+            self.resumed = true;
+            if !sh.demo {
+                let streak = crate::attempts::Log::load(&sh.data_dir).streak;
+                self.attempts = Attempts::resumed(streak);
+            }
+        }
         let wait = self.attempts.tick(ctx);
         let mut submit = false;
         page(ctx, |ui| {
@@ -651,6 +754,9 @@ impl UnlockState {
                             if ready && ui.input(|i| i.key_pressed(Key::Enter)) {
                                 submit = true;
                             }
+                            if !self.rebuild {
+                                self.open_items_ui(ui, sh, w);
+                            }
                             ui.add_space(8.0);
                             ui.vertical_centered(|ui| {
                                 if self.busy {
@@ -705,6 +811,24 @@ mod tests {
         assert_eq!(retry_delay(5), 4.0);
         assert_eq!(retry_delay(6), 8.0);
         assert_eq!(retry_delay(60), 8.0);
+    }
+
+    /// Wrong passwords from before a restart still count: no wait to begin
+    /// with, but the very next wrong try gets the long pause.
+    #[test]
+    fn the_delay_carries_on_after_a_restart() {
+        let mut a = Attempts::resumed(5);
+        assert_eq!(a.failures(), 5);
+        assert!(a.wait().is_none());
+        a.failed();
+        assert!(a.wait().unwrap() > 7.0);
+        let mut fresh = Attempts::resumed(0);
+        fresh.failed();
+        assert!(fresh.wait().is_none(), "the first slip costs nothing");
+        // A hand-edited log cannot overflow the arithmetic.
+        let mut wild = Attempts::resumed(u32::MAX);
+        wild.failed();
+        assert!(wild.wait().unwrap() <= 8.0);
     }
 
     #[test]

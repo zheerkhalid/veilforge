@@ -6,6 +6,7 @@
 //!
 //! The logic lives in this library so that it can be tested; `main.rs` only
 //! parses the command line.
+pub mod attempts;
 pub mod cli;
 pub mod demo;
 pub mod emergency;

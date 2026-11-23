@@ -1,5 +1,6 @@
 //! The window: screens, dialogs and the small password prompt.
 pub mod app;
+mod bidi;
 mod dialogs;
 mod list;
 mod main_view;

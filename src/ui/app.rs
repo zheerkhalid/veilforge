@@ -15,12 +15,12 @@ use super::theme::{self, pal_ctx, Icon};
 use crate::demo::DemoVault;
 use crate::engine::{self, Env, Error, Precheck, Vault};
 use crate::settings::Settings;
-use crate::sys::{self, SysEvent, SysWindow};
+use crate::sys::{self, HotkeyKind, SysEvent, SysWindow};
 use eframe::egui::{
     self, vec2, Align, Align2, CornerRadius, Frame, Layout, Margin, RichText, Stroke,
 };
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -61,6 +61,10 @@ pub const VIEWS: &[&str] = &[
     "empty",
     "results",
     "change-password",
+    "locked-open",
+    "settings-log",
+    "notice",
+    "kurdish",
 ];
 
 /// How the map was opened.
@@ -129,6 +133,13 @@ pub struct Core {
     pub quit: AtomicBool,
     sys: Mutex<Option<SysWindow>>,
     hwnd: AtomicIsize,
+    /// How many items are temporarily open, as far as this process knows.
+    /// Kept up to date by the controller thread for the lock screen and the
+    /// tray icon, which must not wait for the map.
+    open_items: AtomicUsize,
+    /// The real program (not a test, not the demo): other VeilForge
+    /// processes of this user may be asked to lock their items too.
+    real: bool,
 }
 
 fn relax<T>(result: Result<T, std::sync::PoisonError<T>>) -> T {
@@ -148,6 +159,36 @@ impl Core {
             quit: AtomicBool::new(false),
             sys: Mutex::new(None),
             hwnd: AtomicIsize::new(0),
+            open_items: AtomicUsize::new(0),
+            real: false,
+        }
+    }
+
+    /// How many items are temporarily open right now (see `open_items`).
+    pub fn open_items(&self) -> usize {
+        self.open_items.load(Ordering::SeqCst)
+    }
+
+    fn count_open(&self, guard: &MutexGuard<'_, Option<Vault>>) {
+        let open = guard.as_ref().map_or(0, |v| {
+            v.items().iter().filter(|i| i.open_since.is_some()).count()
+        });
+        self.open_items.store(open, Ordering::SeqCst);
+    }
+
+    /// "VeilForge: 2 items are temporarily open", for the tray icon. With the
+    /// neutral title switched on the icon says nothing but "Files".
+    fn tray_tip(&self) -> String {
+        let settings = self.settings();
+        let title = settings.title();
+        if settings.neutral_title {
+            return title.to_string();
+        }
+        match self.open_items() {
+            0 if self.ui_locked.load(Ordering::SeqCst) => format!("{title}: locked"),
+            0 => format!("{title}: unlocked, nothing is open"),
+            1 => format!("{title}: 1 item is temporarily open"),
+            n => format!("{title}: {n} items are temporarily open"),
         }
     }
 
@@ -182,7 +223,101 @@ impl Core {
     /// Sign-out is only held back while there is something to lock again.
     fn update_session_hold(&self, guard: &MutexGuard<'_, Option<Vault>>) {
         let wanted = self.settings().relock_on_session_lock && guard.as_ref().is_some_and(has_open);
-        sys::hold_session_end(wanted);
+        if self.real {
+            sys::hold_session_end(wanted);
+        }
+        self.count_open(guard);
+    }
+
+    /// "Lock everything now" (tray menu, lock hotkey, `--lock-now`, the button
+    /// on the lock screen): every temporarily open item is protected again
+    /// and the window goes back to the unlock screen. Returns what to tell
+    /// the user. Waits for a running operation.
+    pub fn lock_everything(&self, why: &str) -> (String, bool) {
+        let mut guard = self.lock_vault();
+        let mut note = None;
+        if let Some(vault) = guard.as_mut() {
+            let (locked, failed) = relock_everything(vault);
+            note = relock_text(locked, failed, why);
+        }
+        self.lock_app(&mut guard);
+        self.update_session_hold(&guard);
+        drop(guard);
+        if self.real {
+            // An item opened through its stand-in while this window was
+            // locked is held open by a helper process: ask those too.
+            sys::broadcast_lock_now(false);
+        }
+        note.unwrap_or(("Locked.".into(), false))
+    }
+
+    /// Windows was locked, is going to sleep, or the user is signing out.
+    fn session_event(&self) -> Option<(String, bool)> {
+        let settings = self.settings();
+        let mut guard = self.lock_vault();
+        let was_unlocked = !self.ui_locked.load(Ordering::SeqCst);
+        let mut note = None;
+        if let Some(vault) = guard.as_mut() {
+            if settings.relock_on_session_lock && has_open(vault) {
+                let (locked, failed) = relock_everything(vault);
+                note = relock_text(locked, failed, "when Windows was locked");
+            }
+        }
+        self.lock_app(&mut guard);
+        self.update_session_hold(&guard);
+        drop(guard);
+        note.or_else(|| {
+            was_unlocked.then(|| {
+                (
+                    "VeilForge locked itself because Windows was locked or went to sleep.".into(),
+                    false,
+                )
+            })
+        })
+    }
+
+    /// One look at the idle timers. `idle`: seconds without keyboard or mouse
+    /// input. `relocked_this_idle` remembers that the open items were already
+    /// locked during this stretch of inactivity. Never waits for the map.
+    fn idle_tick(&self, idle: u64, relocked_this_idle: &mut bool) -> Vec<(String, bool)> {
+        let mut notes = Vec::new();
+        let settings = self.settings();
+        let auto = u64::from(settings.auto_lock_minutes) * 60;
+        let relock = u64::from(settings.relock_idle_minutes) * 60;
+        if relock == 0 || idle < relock {
+            *relocked_this_idle = false;
+        }
+        // Never wait here: an operation in progress keeps the map busy.
+        let Ok(mut guard) = self.vault.try_lock() else {
+            return notes;
+        };
+        if relock > 0 && idle >= relock && !*relocked_this_idle {
+            *relocked_this_idle = true;
+            if let Some(vault) = guard.as_mut() {
+                let _ = vault.refresh();
+                if has_open(vault) {
+                    let (locked, failed) = relock_everything(vault);
+                    notes.extend(relock_text(
+                        locked,
+                        failed,
+                        "after a period without activity",
+                    ));
+                }
+            }
+        }
+        let ui_locked = self.ui_locked.load(Ordering::SeqCst);
+        if auto > 0 && idle >= auto && !ui_locked && guard.is_some() {
+            self.lock_app(&mut guard);
+            notes.push((
+                "VeilForge locked itself after a period without activity.".into(),
+                false,
+            ));
+        } else if ui_locked {
+            // Drops a kept map once nothing is open any more.
+            self.lock_app(&mut guard);
+        }
+        self.update_session_hold(&guard);
+        notes
     }
 }
 
@@ -226,43 +361,20 @@ fn controller(core: Arc<Core>, rx: Receiver<SysEvent>, tx: Sender<Msg>, ctx: egu
             Ok(
                 event @ (SysEvent::SessionLocked | SysEvent::Suspending | SysEvent::SessionEnding),
             ) => {
-                let settings = core.settings();
-                let mut guard = core.lock_vault();
-                let was_unlocked = !core.ui_locked.load(Ordering::SeqCst);
-                let mut note = None;
-                if let Some(vault) = guard.as_mut() {
-                    if settings.relock_on_session_lock && has_open(vault) {
-                        let (locked, failed) = relock_everything(vault);
-                        note = relock_text(locked, failed, "when Windows was locked");
-                    }
-                }
-                core.lock_app(&mut guard);
-                core.update_session_hold(&guard);
-                drop(guard);
+                let note = core.session_event();
                 if event == SysEvent::SessionEnding {
                     sys::session_end_done();
                 }
-                match note {
-                    Some((text, error)) => notify(text, error),
-                    None if was_unlocked => notify(
-                        "VeilForge locked itself because Windows was locked or went to sleep."
-                            .into(),
-                        false,
-                    ),
-                    None => {}
+                if let Some((text, error)) = note {
+                    notify(text, error);
                 }
             }
             Ok(SysEvent::TrayLock) => {
-                let mut guard = core.lock_vault();
-                let mut note = None;
-                if let Some(vault) = guard.as_mut() {
-                    let (locked, failed) = relock_everything(vault);
-                    note = relock_text(locked, failed, "from the tray menu");
-                }
-                core.lock_app(&mut guard);
-                core.update_session_hold(&guard);
-                drop(guard);
-                let (text, error) = note.unwrap_or(("Locked.".into(), false));
+                let (text, error) = core.lock_everything("from the tray menu");
+                notify(text, error);
+            }
+            Ok(SysEvent::LockAll) => {
+                let (text, error) = core.lock_everything("on request");
                 notify(text, error);
             }
             Ok(SysEvent::Hotkey) => {
@@ -289,43 +401,11 @@ fn controller(core: Arc<Core>, rx: Receiver<SysEvent>, tx: Sender<Msg>, ctx: egu
                 std::process::exit(0);
             }
             Err(RecvTimeoutError::Timeout) => {
-                let settings = core.settings();
-                let idle = sys::idle_seconds();
-                let auto = u64::from(settings.auto_lock_minutes) * 60;
-                let relock = u64::from(settings.relock_idle_minutes) * 60;
-                if relock == 0 || idle < relock {
-                    relocked_this_idle = false;
+                for (text, error) in core.idle_tick(sys::idle_seconds(), &mut relocked_this_idle) {
+                    notify(text, error);
                 }
-                // Never wait here: an operation in progress keeps the map busy.
-                let Ok(mut guard) = core.vault.try_lock() else {
-                    continue;
-                };
-                if relock > 0 && idle >= relock && !relocked_this_idle {
-                    relocked_this_idle = true;
-                    if let Some(vault) = guard.as_mut() {
-                        let _ = vault.refresh();
-                        if has_open(vault) {
-                            let (locked, failed) = relock_everything(vault);
-                            if let Some((text, error)) =
-                                relock_text(locked, failed, "after a period without activity")
-                            {
-                                notify(text, error);
-                            }
-                        }
-                    }
-                }
-                let ui_locked = core.ui_locked.load(Ordering::SeqCst);
-                if auto > 0 && idle >= auto && !ui_locked && guard.is_some() {
-                    core.lock_app(&mut guard);
-                    notify(
-                        "VeilForge locked itself after a period without activity.".into(),
-                        false,
-                    );
-                } else if ui_locked {
-                    // Drops a kept map once nothing is open any more.
-                    core.lock_app(&mut guard);
-                }
-                core.update_session_hold(&guard);
+                let tip = core.tray_tip();
+                core.with_sys(|sys| sys.set_tray_tip(&tip));
             }
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -453,6 +533,41 @@ impl Shared {
                 self.toast(e, true);
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl Shared {
+    /// The shared state of a window that does not exist, on a sandbox: for
+    /// tests that drive the same code the buttons run.
+    pub(super) fn for_test(env: Env) -> (Shared, Receiver<Msg>) {
+        let (tx, rx) = channel();
+        let settings = Settings {
+            // Never open File Explorer windows from a test.
+            open_after_unlock: false,
+            ..Default::default()
+        };
+        let shared = Shared {
+            saved_settings: settings.clone(),
+            core: Arc::new(Core::new(settings.clone())),
+            settings,
+            data_dir: env.data_dir.clone(),
+            env,
+            demo: false,
+            shot: false,
+            tx,
+            toasts: Vec::new(),
+            hwnd: 0,
+            now: crate::util::now(),
+            elevated: false,
+            pending_add: Vec::new(),
+            demo_keep: None,
+            context_menu_on: false,
+            startup_on: false,
+            has_sys: false,
+            real_system: false,
+        };
+        (shared, rx)
     }
 }
 
@@ -644,7 +759,11 @@ impl App {
         });
         let (tx, rx) = channel();
         let hwnd = window_handle(cc);
-        let core = Arc::new(Core::new(settings.clone()));
+        let real_system = !demo && options.sandbox.is_none();
+        let core = Arc::new(Core {
+            real: real_system,
+            ..Core::new(settings.clone())
+        });
         core.hwnd.store(hwnd, Ordering::SeqCst);
 
         // The background window: session notices, hotkey, tray. Not started
@@ -657,7 +776,8 @@ impl App {
             if let Some(sys) = sys {
                 sys.set_tray_title(settings.title());
                 sys.set_tray(settings.tray_icon);
-                sys.set_hotkey(sys::parse_hotkey(&settings.hotkey));
+                sys.set_hotkey(HotkeyKind::Show, sys::parse_hotkey(&settings.hotkey));
+                sys.set_hotkey(HotkeyKind::Lock, sys::parse_hotkey(&settings.lock_hotkey));
                 *relax(core.sys.lock()) = Some(sys);
                 has_sys = true;
                 let (core, tx, ctx) = (core.clone(), tx.clone(), ctx.clone());
@@ -667,7 +787,6 @@ impl App {
             }
         }
 
-        let real_system = !demo && options.sandbox.is_none();
         let mut sh = Shared {
             saved_settings: settings.clone(),
             settings,
@@ -848,13 +967,33 @@ impl App {
                 Msg::Toast(text, error) => self.sh.toast(text, error),
                 Msg::Shown => self.check_inbox(ctx),
                 Msg::Unlocked(result, kind, attempt) => {
+                    // The wrong-password log: when and where, never what.
+                    let logged = !self.sh.demo && kind != UnlockKind::Create;
+                    if logged && matches!(&result, Err(Error::WrongPassword)) {
+                        crate::attempts::record_failure(
+                            &self.sh.data_dir,
+                            crate::attempts::Place::Window,
+                            crate::util::now(),
+                        );
+                    }
                     let go = match &mut self.screen {
                         Screen::Unlock(s) => s.unlocked(result, kind, attempt),
                         Screen::Welcome(s) => s.unlocked(result, kind, attempt),
                         Screen::Main(_) => None,
                     };
                     if let Some(go) = go {
+                        // The user's own slips at this unlock screen are not news.
+                        let own = match &self.screen {
+                            Screen::Unlock(s) => s.own_failures(),
+                            _ => 0,
+                        };
+                        let notice = (logged && matches!(go, Go::Opened { .. }))
+                            .then(|| crate::attempts::record_unlock(&self.sh.data_dir, own))
+                            .and_then(|n| n.text());
                         self.go(ctx, go);
+                        if let (Some(text), Screen::Main(main)) = (notice, &mut self.screen) {
+                            main.attempt_notice = Some(text);
+                        }
                     }
                 }
                 Msg::Background(text, error) => {
@@ -1002,6 +1141,13 @@ impl App {
             && self.sh.settings.stays_in_background();
         if stay {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.sh.settings.lock_on_close && matches!(self.screen, Screen::Main(_)) {
+                // Out of sight, locked: opening the window again asks for
+                // the master password. Open items stay open (they have their
+                // own timers) and the lock screen offers to lock them.
+                self.go(ctx, Go::Lock);
+                self.sh.toasts.clear();
+            }
             sys::hide_window(self.sh.hwnd);
         }
     }
@@ -1032,7 +1178,14 @@ impl App {
                                 ui.horizontal(|ui| {
                                     let icon = if t.error { Icon::ERROR } else { Icon::DONE };
                                     ui.label(RichText::new(icon.glyph()).color(color));
-                                    ui.add(egui::Label::new(t.text.as_str()).wrap());
+                                    let fg = pal_ctx(ui.ctx()).text;
+                                    super::widgets::text(
+                                        ui,
+                                        &t.text,
+                                        super::widgets::BODY_SIZE,
+                                        false,
+                                        fg,
+                                    );
                                 });
                             });
                     }
@@ -1054,8 +1207,13 @@ impl App {
                 if new.tray_icon != old.tray_icon {
                     sys.set_tray(new.tray_icon);
                 }
-                if new.hotkey != old.hotkey {
-                    sys.set_hotkey(sys::parse_hotkey(&new.hotkey));
+                if new.hotkey != old.hotkey || new.lock_hotkey != old.lock_hotkey {
+                    // Both are taken off first, so that swapping the two
+                    // combinations never meets one that is still registered.
+                    sys.set_hotkey(HotkeyKind::Show, None);
+                    sys.set_hotkey(HotkeyKind::Lock, None);
+                    sys.set_hotkey(HotkeyKind::Show, sys::parse_hotkey(&new.hotkey));
+                    sys.set_hotkey(HotkeyKind::Lock, sys::parse_hotkey(&new.lock_hotkey));
                 }
             });
         }
@@ -1149,6 +1307,194 @@ mod tests {
         assert!(read_inbox(&dir).is_empty());
         assert!(dir.join("settings.json").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const PW: &str = "a long master password";
+
+    /// A sandbox with one hidden file that is temporarily open, in a `Core`
+    /// whose window is unlocked: the state the lock triggers start from.
+    fn core_with_an_open_item(
+        tag: &str,
+        settings: Settings,
+    ) -> (crate::engine::cleanup::SandboxGuard, Core, PathBuf, String) {
+        let sandbox = crate::engine::cleanup::SandboxGuard::new(tag);
+        let env = Env::sandbox(sandbox.path());
+        let file = sandbox.path().join("Diary.txt");
+        std::fs::write(&file, b"dear diary").unwrap();
+        let mut vault = Vault::create(env, PW).unwrap();
+        let id = vault
+            .protect(
+                &file,
+                &crate::engine::ProtectOptions::default(),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!file.exists());
+        vault.open_temporarily(&id, &mut |_| {}).unwrap();
+        assert!(file.exists());
+        let core = Core::new(settings);
+        *core.lock_vault() = Some(vault);
+        core.ui_locked.store(false, Ordering::SeqCst);
+        (sandbox, core, file, id)
+    }
+
+    fn reopen(sandbox: &crate::engine::cleanup::SandboxGuard) -> Vault {
+        Vault::open(Env::sandbox(sandbox.path()), PW).unwrap()
+    }
+
+    /// Windows lock, sleep and sign-out all arrive here: open items are
+    /// protected again and the window asks for the password.
+    #[test]
+    fn a_windows_lock_or_sleep_locks_open_items_and_the_window() {
+        let (sandbox, core, file, id) = core_with_an_open_item("sessionlock", Settings::default());
+        let (text, error) = core.session_event().unwrap();
+        assert_eq!(
+            text,
+            "1 temporarily open item was locked again when Windows was locked."
+        );
+        assert!(!error);
+        assert!(!file.exists(), "hidden again");
+        assert!(core.ui_locked.load(Ordering::SeqCst));
+        assert!(
+            core.lock_vault().is_none(),
+            "nothing open: the map is dropped"
+        );
+        assert_eq!(core.open_items(), 0);
+        // A second notice (sleep right after lock) has nothing left to do.
+        assert_eq!(core.session_event(), None);
+
+        let mut vault = reopen(&sandbox);
+        assert_eq!(vault.state(&id), crate::model::State::Locked);
+        vault.release(&id, &mut |_| {}).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"dear diary");
+    }
+
+    /// With "also when Windows locks" switched off the window still locks,
+    /// the item stays open, and the lock screen can lock it without a password.
+    #[test]
+    fn open_items_can_be_locked_from_the_lock_screen() {
+        let settings = Settings {
+            relock_on_session_lock: false,
+            ..Default::default()
+        };
+        let (sandbox, core, file, id) = core_with_an_open_item("lockscreen", settings);
+        let (text, _) = core.session_event().unwrap();
+        assert!(text.starts_with("VeilForge locked itself"), "{text}");
+        assert!(file.exists(), "left open, as the setting says");
+        assert!(core.ui_locked.load(Ordering::SeqCst));
+        assert!(core.lock_vault().is_some(), "kept for locking it later");
+        assert_eq!(core.open_items(), 1);
+        assert_eq!(core.tray_tip(), "VeilForge: 1 item is temporarily open");
+
+        // A program still has the file open: it cannot be locked, and says so.
+        use std::os::windows::fs::OpenOptionsExt;
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&file)
+            .unwrap();
+        let (text, error) = core.lock_everything("from the lock screen");
+        assert!(error, "{text}");
+        assert!(text.starts_with("1 item could not be locked again from the lock screen"));
+        assert!(file.exists());
+        assert_eq!(core.open_items(), 1);
+        drop(held);
+
+        let (text, error) = core.lock_everything("from the lock screen");
+        assert_eq!(
+            text,
+            "1 temporarily open item was locked again from the lock screen."
+        );
+        assert!(!error);
+        assert!(!file.exists());
+        assert!(core.lock_vault().is_none());
+        assert_eq!(core.open_items(), 0);
+        assert_eq!(core.tray_tip(), "VeilForge: locked");
+        // Nothing left: the answer is short.
+        assert_eq!(core.lock_everything("on request").0, "Locked.");
+        // The neutral title gives nothing away in the tray either.
+        core.set_settings(&Settings {
+            neutral_title: true,
+            ..Default::default()
+        });
+        assert_eq!(core.tray_tip(), "Files");
+
+        let mut vault = reopen(&sandbox);
+        vault.release(&id, &mut |_| {}).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"dear diary");
+    }
+
+    /// The two idle timers, with the idle time handed in instead of waiting.
+    #[test]
+    fn idle_time_locks_the_window_first_and_open_items_later() {
+        let settings = Settings {
+            auto_lock_minutes: 5,
+            relock_idle_minutes: 15,
+            ..Default::default()
+        };
+        let (sandbox, core, file, id) = core_with_an_open_item("idle", settings);
+        let mut relocked = false;
+        assert!(core.idle_tick(10, &mut relocked).is_empty());
+        assert!(!core.ui_locked.load(Ordering::SeqCst));
+        assert_eq!(core.tray_tip(), "VeilForge: 1 item is temporarily open");
+
+        // An operation in progress holds the map: the timer never waits for it.
+        {
+            let _busy = core.lock_vault();
+            assert!(core.idle_tick(100_000, &mut relocked).is_empty());
+            assert!(!relocked);
+        }
+
+        // Five minutes: the window locks, the item stays open.
+        let notes = core.idle_tick(5 * 60, &mut relocked);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].0.starts_with("VeilForge locked itself after"));
+        assert!(core.ui_locked.load(Ordering::SeqCst));
+        assert!(file.exists() && !relocked);
+        assert!(core.lock_vault().is_some());
+
+        // Fifteen minutes: the item is locked again, once.
+        let notes = core.idle_tick(15 * 60, &mut relocked);
+        assert_eq!(
+            notes,
+            vec![(
+                "1 temporarily open item was locked again after a period without activity."
+                    .to_string(),
+                false
+            )]
+        );
+        assert!(relocked && !file.exists());
+        assert!(core.lock_vault().is_none());
+        assert!(core.idle_tick(16 * 60, &mut relocked).is_empty());
+        // Activity ends the stretch of inactivity.
+        assert!(core.idle_tick(0, &mut relocked).is_empty());
+        assert!(!relocked);
+
+        let mut vault = reopen(&sandbox);
+        vault.release(&id, &mut |_| {}).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"dear diary");
+    }
+
+    /// "Never" for both timers: nothing happens however long nobody is there.
+    #[test]
+    fn idle_timers_set_to_never_do_nothing() {
+        let settings = Settings {
+            auto_lock_minutes: 0,
+            relock_idle_minutes: 0,
+            ..Default::default()
+        };
+        let (sandbox, core, file, id) = core_with_an_open_item("idlenever", settings);
+        let mut relocked = false;
+        assert!(core.idle_tick(48 * 3600, &mut relocked).is_empty());
+        assert!(!core.ui_locked.load(Ordering::SeqCst));
+        assert!(file.exists() && !relocked);
+        assert_eq!(
+            core.lock_everything("from the tray menu").0,
+            "1 temporarily open item was locked again from the tray menu."
+        );
+        let mut vault = reopen(&sandbox);
+        vault.release(&id, &mut |_| {}).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"dear diary");
     }
 
     #[test]

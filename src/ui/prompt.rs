@@ -312,9 +312,14 @@ pub fn run(spec: PromptSpec, icon: egui::IconData, submit: Submit) -> bool {
                 ctx.load_texture("logo", image, egui::TextureOptions::LINEAR)
             });
             let (tx, rx) = channel();
+            // Wrong passwords typed earlier, anywhere, still count for the delay.
+            let streak = crate::attempts::Log::load(&crate::settings::data_dir()).streak;
             Ok(Box::new(PromptApp {
                 spec,
-                state: PromptState::default(),
+                state: PromptState {
+                    attempts: Attempts::resumed(streak),
+                    ..PromptState::default()
+                },
                 logo,
                 submit: Arc::new(Mutex::new(submit)),
                 tx,

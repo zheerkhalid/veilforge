@@ -181,3 +181,82 @@ fn a_refused_unlock_keeps_the_item_protected_and_listed() {
     assert!(!standin.exists());
     assert_eq!(std::fs::read(&other).unwrap(), b"other");
 }
+
+/// Kurdish and Arabic names (right-to-left, with letters that have no
+/// presentation forms) through every mode: the names in the map, the stand-in
+/// shortcut, the scrambled children and the restored tree are all exact.
+#[test]
+fn kurdish_and_arabic_names_survive_every_mode() {
+    let sandbox = SandboxGuard::new("publicrtl");
+    let env = Env::sandbox(sandbox.path());
+    let mut vault = Vault::create(env.clone(), PW).unwrap();
+    let folder = sandbox.path().join("بەڵگەنامەکانی خێزان");
+    let inner = folder.join("وێنەکان");
+    let file = inner.join("ڕاپۆرتی ساڵانە ٢٠٢٦.pdf");
+    let arabic = folder.join("ملاحظات مهمة.txt");
+    let build = || {
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(&file, "ناوەڕۆک".as_bytes()).unwrap();
+        std::fs::write(&arabic, "محتوى".as_bytes()).unwrap();
+    };
+    build();
+    let modes = [
+        (Mode::Lock, true),
+        (Mode::Hide, true),
+        (Mode::Ask, true),
+        (Mode::Ask, false),
+    ];
+    for (mode, ask_hidden) in modes {
+        let options = ProtectOptions {
+            mode,
+            ask_hidden,
+            scramble: true,
+            group: "کار".into(),
+        };
+        let id = vault.protect(&folder, &options, &mut |_| {}).unwrap();
+        let item = vault.item(&id).unwrap().clone();
+        assert_eq!(item.name, "بەڵگەنامەکانی خێزان");
+        assert_eq!(item.original, folder.to_string_lossy());
+        assert_eq!(vault.groups(), vec!["کار".to_string()]);
+        assert!(std::fs::read_dir(&folder).is_err(), "{mode:?}: closed");
+        if item.hides() {
+            // Nothing in the holding folder carries a letter of the names.
+            let hold = Path::new(item.hold_path.as_deref().unwrap());
+            assert!(hold.file_name().unwrap().to_string_lossy().is_ascii());
+            assert!(item.children.iter().all(|c| c.scrambled.is_ascii()));
+            assert!(item
+                .children
+                .iter()
+                .any(|c| c.original.ends_with("ڕاپۆرتی ساڵانە ٢٠٢٦.pdf")));
+        }
+        if let Some(lnk) = &item.standin {
+            assert!(lnk.ends_with("بەڵگەنامەکانی خێزان.lnk"), "{lnk}");
+            let read = veilforge::standin::read(Path::new(lnk)).unwrap();
+            assert_eq!(veilforge::standin::id_of(&read), Some(id.clone()));
+            // What a double-click on the stand-in resolves to.
+            let target = veilforge::openflow::Target::Path(lnk.into());
+            assert_eq!(
+                veilforge::openflow::resolve(&vault, &target),
+                Some(id.clone())
+            );
+        }
+        assert!(vault.health().iter().all(|h| h.problem.is_empty()));
+
+        vault.open_temporarily(&id, &mut |_| {}).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), "ناوەڕۆک".as_bytes());
+        vault.relock(&id, &mut |_| {}).unwrap();
+        assert_eq!(vault.state(&id), State::Locked);
+
+        vault.release(&id, &mut |_| {}).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), "ناوەڕۆک".as_bytes());
+        assert_eq!(std::fs::read(&arabic).unwrap(), "محتوى".as_bytes());
+        let mut names: Vec<String> = std::fs::read_dir(&folder)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["ملاحظات مهمة.txt", "وێنەکان"], "{mode:?}");
+        assert!(vault.items().is_empty());
+    }
+}

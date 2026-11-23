@@ -1,0 +1,16 @@
+{
+  "theme": "System",
+  "auto_lock_minutes": 5,
+  "relock_idle_minutes": 15,
+  "relock_on_session_lock": true,
+  "neutral_title": false,
+  "tray_icon": true,
+  "hotkey": "",
+  "context_menu": false,
+  "start_with_windows": false,
+  "default_mode": "Hide",
+  "ask_default_hidden": true,
+  "confirm_unlock": true,
+  "open_after_unlock": true,
+  "close_to_background": true
+}

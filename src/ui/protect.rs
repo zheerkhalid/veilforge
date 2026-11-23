@@ -59,24 +59,30 @@ fn hides(mode: Mode, ask_hidden: bool) -> bool {
 
 impl ProtectDlg {
     pub fn new(paths: Vec<PathBuf>, settings: &Settings) -> ProtectDlg {
-        let mut rows: Vec<Row> = Vec::new();
-        for path in paths {
-            let same = |r: &Row| {
-                r.path
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(&path.to_string_lossy())
-            };
-            if !rows.iter().any(same) {
-                rows.push(Row { path, pre: None });
-            }
-        }
-        ProtectDlg {
-            rows,
+        let mut dlg = ProtectDlg {
+            rows: Vec::new(),
             mode: settings.default_mode,
             ask_hidden: settings.ask_default_hidden,
             scramble: None,
             group: String::new(),
+        };
+        dlg.add(paths);
+        dlg
+    }
+
+    /// Adds paths that are not in the list yet (a path differing only in
+    /// upper and lower case is the same file on Windows). Returns the range
+    /// of the new rows, which still have to be checked by the engine.
+    pub fn add(&mut self, paths: Vec<PathBuf>) -> std::ops::Range<usize> {
+        let start = self.rows.len();
+        for path in paths {
+            let key = path.to_string_lossy().to_lowercase();
+            let same = |r: &Row| r.path.to_string_lossy().to_lowercase() == key;
+            if !self.rows.iter().any(same) {
+                self.rows.push(Row { path, pre: None });
+            }
         }
+        start..self.rows.len()
     }
 
     pub fn set_group(&mut self, group: &str) {
@@ -559,6 +565,17 @@ mod tests {
         );
         assert_eq!(dlg.rows.len(), 2);
         assert!(dlg.checking());
+        // More paths dropped on the open dialog: only the new ones are added.
+        let mut more = dlg;
+        let added = more.add(vec![
+            PathBuf::from("C:\\a\\c"),
+            PathBuf::from("D:\\بەڵگەنامەکان"),
+            PathBuf::from("D:\\بەڵگەنامەکان"),
+        ]);
+        assert_eq!(added, 2..3);
+        assert_eq!(more.rows.len(), 3);
+        assert_eq!(more.add(Vec::new()), 3..3);
+        let dlg = more;
         assert!(dlg.plan().is_empty(), "nothing is planned before the check");
 
         let dlg = dialog();

@@ -48,6 +48,11 @@ fn main() -> eframe::Result<()> {
             }
         }
     }
+    if has("--lock-now") {
+        // Nothing is locked from here: the running VeilForge does it.
+        let told = veilforge::sys::broadcast_lock_now(true);
+        std::process::exit(if told > 0 { 0 } else { 1 });
+    }
     if has("--restore-all") {
         let code = veilforge::cli::restore_all_interactive(window_icon(), has("--uninstall"));
         std::process::exit(code);

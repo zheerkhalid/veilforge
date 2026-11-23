@@ -13,7 +13,7 @@ Pick files or folders and lock them, hide them so they cannot be found by name, 
   <img alt="Platform" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?style=for-the-badge&logo=windows11&logoColor=white" />
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-B7410E?style=for-the-badge&logo=rust&logoColor=white" />
   <img alt="License" src="https://img.shields.io/badge/License-MIT-8B5CF6?style=for-the-badge" />
-  <img alt="EXE size" src="https://img.shields.io/badge/EXE-7.1%20MB-475569?style=for-the-badge" />
+  <img alt="EXE size" src="https://img.shields.io/badge/EXE-7.2%20MB-475569?style=for-the-badge" />
 </p>
 
 <p>
@@ -21,7 +21,7 @@ Pick files or folders and lock them, hide them so they cannot be found by name, 
   <img alt="No driver" src="https://img.shields.io/badge/kernel%20driver-none-10C98F?style=flat-square" />
   <img alt="Not encryption" src="https://img.shields.io/badge/files-never%20encrypted%20or%20rewritten-475569?style=flat-square" />
   <img alt="Setup and portable" src="https://img.shields.io/badge/setup%20%2B%20portable-no%20runtimes-10C98F?style=flat-square" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-92%20passing-10C98F?style=flat-square" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-114%20passing-10C98F?style=flat-square" />
   <img alt="Made by Zheer Khalid" src="https://img.shields.io/badge/made%20by-Zheer%20Khalid-FF5A4E?style=flat-square" />
 </p>
 
@@ -30,6 +30,7 @@ Pick files or folders and lock them, hide them so they cannot be found by name, 
 [**Screenshots**](#%EF%B8%8F-screenshots) ·
 [**Download**](#-download) ·
 [**What it does not protect against**](#%EF%B8%8F-what-it-does-not-protect-against) ·
+[**Changelog**](CHANGELOG.md) ·
 [**Developer**](#-developer)
 
 <img src="docs/screenshots/main.png" alt="VeilForge main window" width="900" />
@@ -62,6 +63,7 @@ For hidden folders, VeilForge can also scramble the names of everything inside.
 - One list: name, original location, mode, state, size, date
 - Unlock temporarily, unlock for good, lock all, unlock all
 - Groups and search
+- **Kurdish, Arabic and other right-to-left names** shown properly
 - Optional **Lock / Unlock with VeilForge** in the Explorer right-click menu
 
 </td>
@@ -69,8 +71,9 @@ For hidden folders, VeilForge can also scramble the names of everything inside.
 
 ### 🔑 One master password
 - Strength meter when you set it
-- VeilForge locks itself after a while and when you ask
-- Growing delay after wrong passwords
+- VeilForge locks itself after a while, when its window is closed, and when you ask
+- **A hotkey that locks everything at once**, also as `VeilForge.exe --lock-now`
+- Growing delay after wrong passwords, and a **wrong-password log** that tells you if someone tried while you were away
 - Changing the master password asks for the current one
 - An emergency sheet you can print
 
@@ -118,6 +121,14 @@ For hidden folders, VeilForge can also scramble the names of everything inside.
 <td width="50%" align="center"><b>Settings</b><br><img src="docs/screenshots/settings.png" alt="Settings" /></td>
 <td width="50%" align="center"><b>Light theme</b><br><img src="docs/screenshots/light-theme.png" alt="Light theme" /></td>
 </tr>
+<tr>
+<td width="50%" align="center"><b>Kurdish and Arabic names</b><br><img src="docs/screenshots/kurdish.png" alt="An item with a Kurdish name in the list and the details panel" /></td>
+<td width="50%" align="center"><b>Lock screen with an item still open</b><br><img src="docs/screenshots/locked-open.png" alt="Lock screen offering to lock an open item" /></td>
+</tr>
+<tr>
+<td width="50%" align="center"><b>Wrong passwords while you were away</b><br><img src="docs/screenshots/notice.png" alt="Notice about wrong master passwords" /></td>
+<td width="50%" align="center"><b>Wrong-password log</b><br><img src="docs/screenshots/wrong-passwords.png" alt="Wrong-password log in Settings" /></td>
+</tr>
 </table>
 
 <sub>Screenshots use the built-in demo mode (<code>VeilForge.exe --demo</code>), with invented files.</sub>
@@ -130,12 +141,14 @@ Get it from the [**latest release**](https://github.com/zheerkhalid/veilforge/re
 |---|---|
 | `VeilForge-Setup.exe` | Per-user installer with shortcuts, the optional right-click menu and an uninstaller |
 | `VeilForge-x.y.z-portable-x64.zip` | Portable: unzip and run. The list of protected items lives next to the EXE |
-| `VeilForge.exe` | The bare 7.1 MB EXE |
+| `VeilForge.exe` | The bare 7.2 MB EXE |
 
 **There is no password recovery.** Without the master password VeilForge cannot tell which hidden item is which. Print the emergency sheet, and unlock everything before you reinstall Windows or move a drive to another PC.
 
 > [!NOTE]
-> **First release.** The protection engine, crash recovery and the password-on-open flow have been tested by running them, in temporary folders. Protecting and unlocking from the main window's buttons, the idle and sleep re-lock triggers, and the installer have not yet been tested by hand. Try it on copies of files first.
+> **Version 1.1** adds a hotkey that locks everything, a wrong-password log, proper Kurdish and Arabic names and more. See the [changelog](CHANGELOG.md). Items protected with 1.0.0 stay protected and open as before.
+>
+> **What has been tested, and how.** The protection engine, crash recovery, the password-on-open flow and the upgrade from 1.0.0 (a folder that 1.0.0 left protected, taken over and restored by 1.1) have been tested by running them, in temporary folders. What the main window's buttons do, and locking again after idle time, on a Windows lock and on sleep, are tested by running the same code the buttons and Windows messages reach, without a person clicking. Not yet done by hand: clicking through the window with a mouse, locking or sleeping a real PC, and running the installer. Try it on copies of files first.
 
 ## ⚠️ What it does not protect against
 
@@ -165,6 +178,7 @@ cargo test
 |---|---|
 | `VeilForge.exe --demo` | Invented items; nothing on the PC changes |
 | `VeilForge.exe --restore-all` | Put everything back, after asking for the master password |
+| `VeilForge.exe --lock-now` | Tell the running VeilForge to lock everything now |
 | `VeilForge.exe --selftest` | Protect, check and restore generated files in a temp folder, in every mode |
 
 The icon is drawn in code at build time. The C runtime is linked statically, so the EXE runs on a clean Windows install.

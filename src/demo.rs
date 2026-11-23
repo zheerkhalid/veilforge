@@ -201,6 +201,21 @@ const SPECS: &[Spec] = &[
         state: State::Locked,
         reduced: false,
     },
+    // A Kurdish name in a Kurdish folder: right-to-left text is drawn joined
+    // and in reading order ("Annual report 2026.pdf" in "Documents").
+    Spec {
+        path: "D:\\بەڵگەنامەکان\\ڕاپۆرتی ساڵانە ٢٠٢٦.pdf",
+        kind: Kind::File,
+        mode: Mode::Hide,
+        ask_hidden: false,
+        scrambled: false,
+        group: "Work",
+        size: 3 * MB,
+        files: 1,
+        days_ago: 2,
+        state: State::Locked,
+        reduced: false,
+    },
 ];
 
 fn file_name(path: &str) -> String {
@@ -541,6 +556,28 @@ impl DemoVault {
             Op::ChangePassword { .. } => {}
         }
         out
+    }
+}
+
+/// An invented wrong-password log for the demo's Settings page.
+pub fn attempt_log(now: i64) -> crate::attempts::Log {
+    use crate::attempts::{Attempt, Place};
+    crate::attempts::Log {
+        entries: vec![
+            Attempt {
+                at: now - 9 * 86_400 - 4_000,
+                place: Place::Window,
+            },
+            Attempt {
+                at: now - 2 * 86_400 - 30_500,
+                place: Place::StandIn,
+            },
+            Attempt {
+                at: now - 2 * 86_400 - 30_460,
+                place: Place::StandIn,
+            },
+        ],
+        ..Default::default()
     }
 }
 

@@ -76,6 +76,16 @@ pub struct Main {
     /// The group box in the details panel: (item id, text being typed).
     pub(super) group_edit: Option<(String, String)>,
     pub(super) hotkey_text: Option<String>,
+    pub(super) lock_hotkey_text: Option<String>,
+    /// Wrong master passwords typed while the user was away, told once
+    /// after unlocking (see `crate::attempts`).
+    pub attempt_notice: Option<String>,
+    /// The wrong-password log as the Settings page shows it; read again
+    /// when the page is opened.
+    pub(super) attempt_log: Option<crate::attempts::Log>,
+    /// Show the end of the Settings page (the `settings-log` view), until
+    /// the user scrolls or clicks.
+    pub(super) settings_at_end: bool,
 }
 
 impl Main {
@@ -104,6 +114,10 @@ impl Main {
             precheck_gen: 0,
             group_edit: None,
             hotkey_text: None,
+            lock_hotkey_text: None,
+            attempt_notice: None,
+            attempt_log: None,
+            settings_at_end: false,
         }
     }
 
@@ -258,6 +272,18 @@ impl Main {
             let wrong = matches!(error, Error::WrongPassword);
             if wrong {
                 self.attempts.failed();
+                if !sh.demo {
+                    crate::attempts::record_failure(
+                        &sh.data_dir,
+                        if kind == OpKind::ChangePassword {
+                            crate::attempts::Place::ChangePassword
+                        } else {
+                            crate::attempts::Place::Restore
+                        },
+                        crate::util::now(),
+                    );
+                    self.attempt_log = None;
+                }
             }
             let (text, detail) = ops::explain(&error);
             let text = if detail.is_empty() {
@@ -337,30 +363,66 @@ impl Main {
         }
         self.tab = Tab::Items;
         self.precheck_gen += 1;
-        let generation = self.precheck_gen;
-        let mut dlg = super::protect::ProtectDlg::new(paths.clone(), &sh.settings);
-        if self.demo.is_some() {
-            for (index, path) in paths.iter().enumerate() {
-                dlg.checked(index, crate::demo::precheck(path), &sh.settings);
-            }
-        } else {
-            // One worker goes through the paths in order; counting a large
-            // folder takes a while and must never block the window.
-            let (tx, env, ctx) = (sh.tx.clone(), sh.env.clone(), ctx.clone());
-            std::thread::spawn(move || {
-                for (index, path) in paths.iter().enumerate() {
-                    let pre = crate::engine::precheck(&env, path);
-                    if tx
-                        .send(Msg::Precheck(generation, index, Box::new(pre)))
-                        .is_err()
-                    {
-                        return;
-                    }
-                    ctx.request_repaint();
-                }
-            });
-        }
+        let mut dlg = super::protect::ProtectDlg::new(Vec::new(), &sh.settings);
+        let added = dlg.add(paths);
+        self.check_rows(ctx, sh, &mut dlg, added);
         self.dialog = Some(Dialog::Protect(Box::new(dlg)));
+    }
+
+    /// Asks the engine about the rows `added` of the "Protect" dialog.
+    fn check_rows(
+        &self,
+        ctx: &egui::Context,
+        sh: &Shared,
+        dlg: &mut super::protect::ProtectDlg,
+        added: std::ops::Range<usize>,
+    ) {
+        let generation = self.precheck_gen;
+        let rows: Vec<(usize, PathBuf)> = added
+            .filter_map(|index| dlg.rows.get(index).map(|r| (index, r.path.clone())))
+            .collect();
+        if self.demo.is_some() {
+            for (index, path) in rows {
+                dlg.checked(index, crate::demo::precheck(&path), &sh.settings);
+            }
+            return;
+        }
+        if rows.is_empty() {
+            return;
+        }
+        // One worker goes through the paths in order; counting a large
+        // folder takes a while and must never block the window.
+        let (tx, env, ctx) = (sh.tx.clone(), sh.env.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            for (index, path) in rows {
+                let pre = crate::engine::precheck(&env, &path);
+                if tx
+                    .send(Msg::Precheck(generation, index, Box::new(pre)))
+                    .is_err()
+                {
+                    return;
+                }
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// More files were dropped while the "Protect" dialog is open: they join
+    /// the list in it. Returns how many were new.
+    pub(super) fn add_to_protect(
+        &mut self,
+        ctx: &egui::Context,
+        sh: &Shared,
+        paths: Vec<PathBuf>,
+    ) -> usize {
+        let Some(Dialog::Protect(mut dlg)) = self.dialog.take() else {
+            return 0;
+        };
+        let added = dlg.add(paths);
+        let count = added.len();
+        self.check_rows(ctx, sh, &mut dlg, added);
+        self.dialog = Some(Dialog::Protect(dlg));
+        count
     }
 
     /// The file pickers. In the demo, invented paths are offered instead: a
@@ -397,13 +459,18 @@ impl Main {
     // Frame
     // ----------------------------------------------------------------------------------
 
-    fn handle_keys(&mut self, ctx: &egui::Context) {
-        let (find, escape) = ctx.input(|i| {
+    /// Returns true when Ctrl+L asked to lock VeilForge.
+    fn handle_keys(&mut self, ctx: &egui::Context) -> bool {
+        let (find, escape, lock) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(Key::F),
                 i.key_pressed(Key::Escape),
+                i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::L),
             )
         });
+        if lock && self.dialog.is_none() && self.job.is_none() {
+            return true;
+        }
         if find && self.dialog.is_none() {
             self.tab = Tab::Items;
             self.focus_search = true;
@@ -417,6 +484,7 @@ impl Main {
                 self.checked.clear();
             }
         }
+        false
     }
 
     fn header(
@@ -492,7 +560,7 @@ impl Main {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if widgets::ghost_button(ui, &Icon::LOCK.with("Lock VeilForge"))
                             .on_hover_text(
-                                "Close the list and ask for the master password again. Protected items stay protected.",
+                                "Close the list and ask for the master password again (Ctrl+L). Protected items stay protected.",
                             )
                             .clicked()
                         {
@@ -666,7 +734,7 @@ impl Main {
         if sh.shot {
             return;
         }
-        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        let hovering = ctx.input(|i| i.raw.hovered_files.len());
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -674,8 +742,10 @@ impl Main {
                 .filter_map(|f| f.path.clone())
                 .collect()
         });
-        let can_take = self.dialog.is_none() && self.job.is_none();
-        if hovering {
+        // While the "Protect" dialog is open, a drop adds to its list.
+        let adding = matches!(self.dialog, Some(Dialog::Protect(_)));
+        let can_take = (self.dialog.is_none() || adding) && self.job.is_none();
+        if hovering > 0 {
             let p = pal_ctx(ctx);
             let screen = ctx.screen_rect();
             let painter = ctx.layer_painter(egui::LayerId::new(
@@ -700,18 +770,20 @@ impl Main {
             painter.text(
                 inner.center() + vec2(0.0, 14.0),
                 Align2::CENTER_CENTER,
-                if can_take {
-                    "Drop to protect"
-                } else {
-                    "Finish what is open first"
-                },
+                drop_title(hovering, can_take, adding),
                 semibold(24.0),
                 p.text,
             );
             painter.text(
                 inner.center() + vec2(0.0, 44.0),
                 Align2::CENTER_CENTER,
-                "You choose how in the next step. Nothing happens until you confirm.",
+                if !can_take {
+                    "Close the dialog or wait for the running operation, then drop again."
+                } else if adding {
+                    "They join the list in the dialog. Nothing happens until you confirm."
+                } else {
+                    "You choose how in the next step. Nothing happens until you confirm."
+                },
                 regular(14.5),
                 p.muted,
             );
@@ -722,6 +794,17 @@ impl Main {
                     "Finish what is open first, then drop the files again.",
                     true,
                 );
+            } else if adding {
+                let paths = if self.demo.is_some() {
+                    crate::demo::sample_paths()
+                } else {
+                    dropped
+                };
+                match self.add_to_protect(ctx, sh, paths) {
+                    0 => sh.toast("Those are already in the list.", false),
+                    1 => sh.toast("1 more item added to the list.", false),
+                    n => sh.toast(format!("{n} more items added to the list."), false),
+                }
             } else if self.demo.is_some() {
                 // Real names never appear in the demo.
                 self.offer_protect(ctx, sh, crate::demo::sample_paths());
@@ -738,7 +821,9 @@ impl Main {
         logo: Option<&TextureHandle>,
     ) -> Option<Go> {
         let mut go = None;
-        self.handle_keys(ctx);
+        if self.handle_keys(ctx) {
+            go = Some(Go::Lock);
+        }
         if self.job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -778,6 +863,17 @@ impl Main {
     }
 }
 
+/// The big line of the drop overlay.
+fn drop_title(hovering: usize, can_take: bool, adding: bool) -> String {
+    match (can_take, adding, hovering) {
+        (false, ..) => "Finish what is open first".to_string(),
+        (true, false, 0 | 1) => "Drop to protect".to_string(),
+        (true, false, n) => format!("Drop to protect {n} items"),
+        (true, true, 0 | 1) => "Drop to add to the list".to_string(),
+        (true, true, n) => format!("Drop to add {n} items to the list"),
+    }
+}
+
 /// The screen a `--view` name opens in the demo (and in screenshots).
 pub fn demo_screen(view: &str, sh: &mut Shared) -> Screen {
     let now = sh.now;
@@ -792,8 +888,22 @@ pub fn demo_screen(view: &str, sh: &mut Shared) -> Screen {
     match view {
         "welcome" => return Screen::Welcome(Box::new(CreateState::demo_filled())),
         "unlock" => return Screen::Unlock(Box::default()),
+        // The lock screen while an item is still temporarily open.
+        "locked-open" => {
+            sh.demo_keep = Some(DemoVault::sample(now));
+            return Screen::Unlock(Box::default());
+        }
         "empty" => main = Main::new(Snapshot::default(), Some(DemoVault::empty(now))),
         "details" => main.selected = id_of(&main, "Side project"),
+        // An item with a Kurdish name, in the list and in the details panel.
+        "kurdish" => {
+            main.selected = main
+                .snap
+                .items
+                .iter()
+                .find(|i| !i.name.is_ascii())
+                .map(|i| i.id.clone());
+        }
         "selection" => {
             for name in ["Tax 2025", "Passport scan.pdf", "Client contracts"] {
                 if let Some(id) = id_of(&main, name) {
@@ -819,6 +929,21 @@ pub fn demo_screen(view: &str, sh: &mut Shared) -> Screen {
             }
         }
         "settings" => main.tab = Tab::Settings,
+        // The lower half of the Settings page: hotkeys, wrong-password log.
+        "settings-log" => {
+            main.tab = Tab::Settings;
+            main.settings_at_end = true;
+            sh.settings.lock_hotkey = "Ctrl+Alt+L".into();
+        }
+        // The list with the notice about wrong passwords typed meanwhile.
+        "notice" => {
+            let log = crate::demo::attempt_log(now);
+            main.attempt_notice = crate::attempts::Notice {
+                count: 2,
+                last: log.entries.last().copied(),
+            }
+            .text();
+        }
         "about" => main.tab = Tab::About,
         "results" => {
             let lines = vec![
@@ -835,4 +960,19 @@ pub fn demo_screen(view: &str, sh: &mut Shared) -> Screen {
         _ => {}
     }
     Screen::Main(Box::new(main))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_drop_overlay_says_what_a_drop_will_do() {
+        assert_eq!(drop_title(1, true, false), "Drop to protect");
+        assert_eq!(drop_title(4, true, false), "Drop to protect 4 items");
+        assert_eq!(drop_title(1, true, true), "Drop to add to the list");
+        assert_eq!(drop_title(3, true, true), "Drop to add 3 items to the list");
+        assert_eq!(drop_title(3, false, false), "Finish what is open first");
+        assert_eq!(drop_title(3, false, true), "Finish what is open first");
+    }
 }

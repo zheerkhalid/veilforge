@@ -18,11 +18,14 @@ pub const USAGE: &str = "VeilForge
         [--uninstall]                protected item back exactly as it was
                                      exit code 0 = nothing is protected any more,
                                      1 = cancelled, 2 = some items could not be restored
+  VeilForge.exe --lock-now           lock everything now: tells the running VeilForge to protect
+                                     every temporarily open item again and to lock itself
+                                     exit code 0 = it was told, 1 = VeilForge is not running
   VeilForge.exe --tray               start in the tray (what the start-with-Windows entry runs)
   VeilForge.exe --demo               show invented data; nothing on this PC is read or changed
   VeilForge.exe --screenshot <png>   render the window (1280x800) to a PNG and exit
-        [--view welcome|unlock|main|details|selection|protect|prompt|health|panic|
-                settings|about|empty] [--light]
+        [--view welcome|unlock|locked-open|main|notice|details|kurdish|selection|
+                protect|prompt|health|panic|settings|settings-log|about|empty] [--light]
   VeilForge.exe --selftest           protect, verify and restore invented files inside one temp
                                      folder with every mode; nothing else is touched";
 
@@ -119,7 +122,9 @@ pub fn restore_all_interactive(icon: egui::IconData, uninstall: bool) -> i32 {
         spec,
         icon,
         Box::new(move |password| {
-            let report = restore_all(env.clone(), password).map_err(|e| e.to_string())?;
+            let result = restore_all(env.clone(), password);
+            crate::openflow::note_attempt(&env.data_dir, &result, crate::attempts::Place::Restore);
+            let report = result.map_err(|e| e.to_string())?;
             if let Ok(mut g) = submit_slot.lock() {
                 *g = Some(report);
             }

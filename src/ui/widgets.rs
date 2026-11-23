@@ -285,6 +285,35 @@ pub fn chip(ui: &mut Ui, label: &str, count: Option<usize>, active: bool) -> Res
             Stroke::new(1.0_f32, p.border),
         )
     };
+    if super::bidi::needs_native(&text) {
+        // A group named in Kurdish or Arabic: the same chip, drawn by hand
+        // around text that Windows shaped.
+        if let Some(size) = super::bidi::measure(ui, &text, 13.0, false) {
+            let (rect, resp) = ui.allocate_exact_size(vec2(size.x + 22.0, 30.0), Sense::click());
+            let fill = if resp.hovered() && !active {
+                p.hover
+            } else {
+                fill
+            };
+            ui.painter().rect(
+                rect,
+                CornerRadius::same(15),
+                fill,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            super::bidi::paint(
+                ui,
+                rect.shrink2(vec2(11.0, 0.0)),
+                &text,
+                13.0,
+                false,
+                fg,
+                false,
+            );
+            return resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        }
+    }
     let b = egui::Button::new(RichText::new(text).size(13.0).color(fg))
         .fill(fill)
         .stroke(stroke)
@@ -311,8 +340,22 @@ pub fn elided(
     ui.fonts(|f| f.layout_job(job))
 }
 
+/// Whether `font` is the semibold face (for text drawn by Windows).
+fn is_bold(font: &FontId) -> bool {
+    matches!(&font.family, egui::FontFamily::Name(name) if name.as_ref() == "semibold")
+}
+
 /// Paints one elided line, vertically centred in `rect`. Returns whether it was cut.
+/// Kurdish, Arabic and other right-to-left text is drawn by Windows, joined
+/// and in reading order (see `bidi`).
 pub fn text_in(ui: &Ui, rect: Rect, text: &str, font: FontId, color: Color32) -> bool {
+    if super::bidi::needs_native(text) {
+        if let Some(cut) =
+            super::bidi::paint(ui, rect, text, font.size, is_bold(&font), color, false)
+        {
+            return cut;
+        }
+    }
     let galley = elided(ui, text, font, color, rect.width());
     let cut = galley.elided;
     ui.painter().galley(
@@ -325,6 +368,11 @@ pub fn text_in(ui: &Ui, rect: Rect, text: &str, font: FontId, color: Color32) ->
 
 /// Like [`text_in`], right-aligned.
 pub fn text_in_right(ui: &Ui, rect: Rect, text: &str, font: FontId, color: Color32) {
+    if super::bidi::needs_native(text)
+        && super::bidi::paint(ui, rect, text, font.size, is_bold(&font), color, true).is_some()
+    {
+        return;
+    }
     let galley = elided(ui, text, font, color, rect.width());
     ui.painter().galley(
         pos2(
@@ -615,7 +663,8 @@ pub fn banner(ui: &mut Ui, icon: Icon, color: Color32, text: &str) {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(RichText::new(icon.glyph()).color(color));
-                ui.add(egui::Label::new(RichText::new(text).size(13.5)).wrap());
+                let fg = pal(ui).text;
+                super::bidi::wrapped(ui, text, 13.5, false, fg);
             });
         });
 }
@@ -689,6 +738,11 @@ pub fn field(ui: &mut Ui, label: &str, value: &str) {
     ui.label(RichText::new(label).size(12.0).color(p.faint));
     ui.add_space(-6.0);
     let empty = value.trim().is_empty();
+    if super::bidi::needs_native(value) {
+        super::bidi::wrapped(ui, value, BODY_SIZE, false, p.text);
+        ui.add_space(2.0);
+        return;
+    }
     ui.add(
         egui::Label::new(
             RichText::new(if empty { "None" } else { value }).color(if empty {
@@ -724,14 +778,28 @@ pub fn left_row(ui: &mut Ui, height: f32, add: impl FnOnce(&mut Ui)) {
 
 /// The title of a modal dialog.
 pub fn dialog_title(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).font(semibold(19.0)));
+    if super::bidi::needs_native(text) {
+        let p = pal(ui);
+        super::bidi::label(ui, text, 19.0, true, p.text);
+    } else {
+        ui.label(RichText::new(text).font(semibold(19.0)));
+    }
     ui.add_space(2.0);
+}
+
+/// The size of ordinary text (the `Body` text style of the theme).
+pub const BODY_SIZE: f32 = 14.0;
+
+/// A wrapped line or paragraph of ordinary text in any script. Use it
+/// wherever a file or folder name is part of the text.
+pub fn text(ui: &mut Ui, text: &str, size: f32, bold: bool, color: Color32) -> Response {
+    super::bidi::wrapped(ui, text, size, bold, color)
 }
 
 /// A wrapped paragraph in a dialog.
 pub fn para(ui: &mut Ui, text: &str) {
     let p = pal(ui);
-    ui.add(egui::Label::new(RichText::new(text).color(p.muted)).wrap());
+    super::bidi::wrapped(ui, text, BODY_SIZE, false, p.muted);
 }
 
 /// A password box with a show/hide button on its right; `width` is the
